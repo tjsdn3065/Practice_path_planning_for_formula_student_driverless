@@ -67,7 +67,7 @@ namespace cfg
         // 출력 옵션: 폐루프 시 마지막 샘플 = 첫 샘플 복제 여부
         bool emit_closed_duplicate = true;
 
-        bool auto_order_rings = true; // 입력 링(콘 좌표) 자동 정렬
+        bool auto_order_rings = false; // 입력 링(콘 좌표) 자동 정렬
         int nn_k_order = 8;           // NN 경로에서 후보 이웃 수
         int two_opt_iters = 2000;     // 2-opt 개선 횟수
 
@@ -116,6 +116,10 @@ namespace cfg
         double step_init = 0.6;      // 초기 스텝 (Armijo)
         double step_min = 1e-6;      // 최소 스텝
         double armijo_c = 1e-5;      // Armijo 계수
+
+        double a_lat_max    = 10.0;   // A_LAT_MAX
+        double kappa_eps    = 1e-6;   // KAPPA_EPS
+        double v_cap_mps    = 27.0;   // 최대 속도 캡
     };
     inline Config &get()
     {
@@ -679,140 +683,583 @@ namespace delaunay
         double u = unum / den;
         return (t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0);
     }
+    // ===== Neighbors: 삼각형 이웃 관리 =====
+    using NeighArr = std::array<int, 3>; // 각 삼각형의 이웃 tri index, 없으면 -1
 
-    inline bool insertConstraintEdge(vector<Tri> &T, const vector<Vec2> &P,
-                                     int a, int b,
-                                     const std::unordered_set<EdgeKey, EdgeKeyHash> &forced_set,
-                                     int &globalFlipBudget)
+    static inline int edgeIndexInTri(const Tri& tr, int u, int v)
     {
-        if (a == b)
-            return true;
-        std::unordered_map<EdgeKey, vector<EdgeRef>, EdgeKeyHash> M;
-        buildEdgeMap(T, M);
-        if (hasEdge(M, a, b))
-            return true;
-
-        const Vec2 &A = P[a], &B = P[b];
-        int flips = 0;
-        auto &C = cfg::get();
-
-        while (!hasEdge(M, a, b))
+        int A[3] = { tr.a, tr.b, tr.c };
+        for (int i = 0; i < 3; ++i)
         {
-            if (globalFlipBudget <= 0 || flips >= C.max_flips_per_segment)
-                return false;
-
-            struct Hit
-            {
-                int u, v, t1, t2;
-                double t;
-            };
-            vector<Hit> hits;
-            hits.reserve(64);
-
-            for (const auto &kv : M)
-            {
-                int u = kv.first.u, v = kv.first.v;
-                if (u == a || v == a || u == b || v == b)
-                    continue;
-                if (forced_set.count(kv.first))
-                    continue;
-
-                int t1 = -1, t2 = -1;
-                if (!findEdgeTris(M, u, v, t1, t2))
-                    continue;
-                if (geom::segIntersectProper(A, B, P[u], P[v]))
-                {
-                    double tp;
-                    if (intersectParamT(A, B, P[u], P[v], tp))
-                        hits.push_back({u, v, t1, t2, tp});
-                }
-            }
-            if (hits.empty())
-                return false;
-            std::sort(hits.begin(), hits.end(), [](const Hit &x, const Hit &y)
-                      { return x.t < y.t; });
-
-            bool did = false;
-            for (const auto &h : hits)
-            {
-                if (globalFlipBudget <= 0)
-                    return false;
-                if (flipDiagonal(T, P, h.t1, h.t2, h.u, h.v))
-                {
-                    did = true;
-                    flips++;
-                    globalFlipBudget--;
-                    break;
-                }
-            }
-            if (!did)
-                return false;
-            buildEdgeMap(T, M);
+            int x = A[i], y = A[(i + 1) % 3];
+            if ((x == u && y == v) || (x == v && y == u))
+                return i;
         }
+        return -1;
+    }
+
+    static inline void buildNeighborsFromMap(
+        const std::vector<Tri>& T,
+        const std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
+        std::vector<NeighArr>& N)
+    {
+        N.assign(T.size(), NeighArr{ -1, -1, -1 });
+        for (int tid = 0; tid < (int)T.size(); ++tid)
+        {
+            const Tri& tr = T[tid];
+            int A[3] = { tr.a, tr.b, tr.c };
+            for (int i = 0; i < 3; ++i)
+            {
+                int u = A[i], v = A[(i + 1) % 3];
+                auto it = M.find(EdgeKey(u, v));
+                if (it == M.end()) continue;
+                int other = -1;
+                for (const auto& er : it->second)
+                    if (er.tri != tid) { other = er.tri; break; }
+                N[tid][i] = other;
+            }
+        }
+        // 역참조 보정
+        for (int tid = 0; tid < (int)T.size(); ++tid)
+        {
+            const Tri& tr = T[tid];
+            for (int ei = 0; ei < 3; ++ei)
+            {
+                int t2 = N[tid][ei];
+                if (t2 < 0) continue;
+                const Tri& tr2 = T[t2];
+                int A[3] = { tr.a, tr.b, tr.c };
+                int u = A[ei], v = A[(ei + 1) % 3];
+                int e2 = edgeIndexInTri(tr2, v, u); // 반대 방향
+                if (e2 >= 0)
+                    N[t2][e2] = tid;
+            }
+        }
+    }
+
+    // ----- Reusable state -----
+    struct CDTWorkState {
+        std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash> M; // edge -> tris(<=2)
+        std::vector<NeighArr> N;      // tri neighbors
+        std::vector<int> vert2tri;    // vertex -> any incident triangle id (or -1)
+    };
+
+    static inline void buildVert2Tri(const std::vector<Tri>& T, int nVerts, std::vector<int>& v2t){
+        v2t.assign(nVerts, -1);
+        for (int tid = 0; tid < (int)T.size(); ++tid){
+            const Tri& tr = T[tid];
+            if (tr.a >=0 && tr.a<nVerts && v2t[tr.a] == -1) v2t[tr.a] = tid;
+            if (tr.b >=0 && tr.b<nVerts && v2t[tr.b] == -1) v2t[tr.b] = tid;
+            if (tr.c >=0 && tr.c<nVerts && v2t[tr.c] == -1) v2t[tr.c] = tid;
+        }
+    }
+
+    static inline void buildState(const std::vector<Tri>& T, int nVerts, CDTWorkState& S){
+        buildEdgeMap(T, S.M);
+        buildNeighborsFromMap(T, S.M, S.N);
+        buildVert2Tri(T, nVerts, S.vert2tri);
+    }
+
+    // flip 후 vert2tri 갱신
+    static inline void updateMapsAfterFlip_v2t(int tid, const Tri& tri, std::vector<int>& v2t){
+        if (tri.a >= 0 && tri.a < (int)v2t.size()) v2t[tri.a] = tid;
+        if (tri.b >= 0 && tri.b < (int)v2t.size()) v2t[tri.b] = tid;
+        if (tri.c >= 0 && tri.c < (int)v2t.size()) v2t[tri.c] = tid;
+    }
+
+    static inline void rebuildLocalNeighborsForTri(
+        int tid,
+        const std::vector<Tri>& T,
+        const std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
+        std::vector<NeighArr>& N)
+    {
+        const Tri& tr = T[tid];
+        int A[3] = { tr.a, tr.b, tr.c };
+        for (int i = 0; i < 3; ++i)
+        {
+            int u = A[i], v = A[(i + 1) % 3];
+            int other = -1;
+            auto it = M.find(EdgeKey(u, v));
+            if (it != M.end())
+            {
+                for (const auto& er : it->second)
+                    if (er.tri != tid) { other = er.tri; break; }
+            }
+            N[tid][i] = other;
+            if (other >= 0)
+            {
+                int e2 = edgeIndexInTri(T[other], v, u);
+                if (e2 >= 0)
+                    N[other][e2] = tid;
+            }
+        }
+    }
+
+    // 점이 삼각형 내부/경계에 있는지(부동소수 안정) 
+    static inline bool pointInTriOrOnEdge(
+        const Vec2& p, const Vec2& a, const Vec2& b, const Vec2& c, double eps = 1e-15)
+    {
+        double s1 = geom::orient2d_filt(a, b, p);
+        double s2 = geom::orient2d_filt(b, c, p);
+        double s3 = geom::orient2d_filt(c, a, p);
+        bool hasNeg = (s1 < -eps) || (s2 < -eps) || (s3 < -eps);
+        bool hasPos = (s1 > +eps) || (s2 > +eps) || (s3 > +eps);
+        return !(hasNeg && hasPos);
+    }
+
+    // (A,B) 세그먼트가 (U,V)와 내부에서 교차하는지
+    static inline bool segmentStrictIntersectAB_E(
+        const Vec2& A, const Vec2& B, const Vec2& U, const Vec2& V, double& tAB, double tiny = 1e-12)
+    {
+        double t;
+        if (!intersectParamT(A, B, U, V, t)) return false;
+        if (t <= tiny || t >= 1.0 - tiny) return false;
+        tAB = t;
         return true;
     }
 
-    inline void legalizeCDT(vector<Tri> &T, const vector<Vec2> &P,
-                            const std::unordered_set<EdgeKey, EdgeKeyHash> &forced_set,
-                            int max_passes = 3)
+    // A를 포함하는 삼각형을 느리지만 안전하게 찾기(선형검색)
+    static inline int locateTriangleSlow(const std::vector<Tri>& T, const std::vector<Vec2>& P, const Vec2& X)
+    {
+        for (int tid = 0; tid < (int)T.size(); ++tid)
+        {
+            const Tri& tr = T[tid];
+            if (pointInTriOrOnEdge(X, P[tr.a], P[tr.b], P[tr.c]))
+                return tid;
+        }
+        return -1;
+    }
+
+    // A->B가 현재 삼각형 t에서 어떤 엣지로 나가는지 선택
+    static inline bool pickCrossingEdge(
+        int t, const std::vector<Tri>& T, const std::vector<Vec2>& P,
+        const Vec2& A, const Vec2& B, int& eidx_out, double& tab_out)
+    {
+        const Tri& tr = T[t];
+        int V[3] = { tr.a, tr.b, tr.c };
+        const Vec2 E0 = P[V[0]], E1 = P[V[1]], E2 = P[V[2]];
+        struct Cand { int e; double t; };
+        std::vector<Cand> cand; cand.reserve(3);
+
+        double t0;
+        if (segmentStrictIntersectAB_E(A, B, E0, E1, t0)) cand.push_back({ 0, t0 });
+        if (segmentStrictIntersectAB_E(A, B, E1, E2, t0)) cand.push_back({ 1, t0 });
+        if (segmentStrictIntersectAB_E(A, B, E2, E0, t0)) cand.push_back({ 2, t0 });
+
+        if (cand.empty()) return false;
+        std::sort(cand.begin(), cand.end(), [](const Cand& x, const Cand& y) { return x.t < y.t; });
+        eidx_out = cand.front().e;
+        tab_out = cand.front().t;
+        return true;
+    }
+
+    // (NEW) 플립 후 엣지맵/이웃 국소 갱신
+    static inline void updateMapsAfterFlip(
+        const int t1, const int t2,
+        const Tri& old1, const Tri& old2,
+        std::vector<Tri>& T,
+        std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
+        std::vector<NeighArr>& N)
+    {
+        auto removeTriEdges = [&](int tid, const Tri& tri)
+        {
+            int A[3] = { tri.a, tri.b, tri.c };
+            for (int i = 0; i < 3; ++i)
+            {
+                EdgeKey k(A[i], A[(i + 1) % 3]);
+                auto it = M.find(k);
+                if (it == M.end()) continue;
+                auto& vec = it->second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(),
+                    [&](const EdgeRef& er)
+                    {
+                        return (er.tri == tid) &&
+                            ((er.a == A[i] && er.b == A[(i + 1) % 3]) ||
+                                (er.a == A[(i + 1) % 3] && er.b == A[i]));
+                    }), vec.end());
+                if (vec.empty()) M.erase(it);
+            }
+        };
+        auto addTriEdges = [&](int tid, const Tri& tri)
+        {
+            int A[3] = { tri.a, tri.b, tri.c };
+            for (int i = 0; i < 3; ++i)
+                M[EdgeKey(A[i], A[(i + 1) % 3])].push_back({ tid, A[i], A[(i + 1) % 3] });
+        };
+
+        removeTriEdges(t1, old1);
+        removeTriEdges(t2, old2);
+        addTriEdges(t1, T[t1]);
+        addTriEdges(t2, T[t2]);
+
+        // 이웃 로컬 리빌드
+        rebuildLocalNeighborsForTri(t1, T, M, N);
+        rebuildLocalNeighborsForTri(t2, T, M, N);
+    }
+
+    // (NEW) flipDiagonal + 국소 갱신 래퍼
+    static inline bool tryFlipAndUpdate(
+        std::vector<Tri>& T, const std::vector<Vec2>& P,
+        int t1, int t2, int u, int v,
+        std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
+        std::vector<NeighArr>& N)
+    {
+        Tri before1 = T[t1], before2 = T[t2];
+        if (!flipDiagonal(T, P, t1, t2, u, v)) return false;
+        updateMapsAfterFlip(t1, t2, before1, before2, T, M, N);
+        return true;
+    }
+
+    struct EdgeLocal { int a, b; };
+
+    static inline void pushIfFree(std::vector<EdgeLocal>& q, int a, int b,
+                                const std::unordered_set<EdgeKey, EdgeKeyHash>& forced){
+        EdgeKey k(a,b);
+        if (!forced.count(k)) q.push_back({std::min(a,b), std::max(a,b)});
+    }
+
+    static inline void localLegalizeQueue(
+        std::vector<Tri>& T, const std::vector<Vec2>& P,
+        const std::unordered_set<EdgeKey, EdgeKeyHash>& forced,
+        CDTWorkState& S, std::vector<EdgeLocal>& seeds,
+        int flip_budget = 1<<30)
+    {
+        while (!seeds.empty() && flip_budget>0){
+            EdgeLocal e = seeds.back(); seeds.pop_back();
+            if (forced.count(EdgeKey(e.a,e.b))) continue;
+
+            int t1=-1,t2=-1;
+            if (!findEdgeTris(S.M, e.a, e.b, t1, t2)) continue;
+            if (t1<0 || t2<0) continue;
+
+            int c=-1,d=-1;
+            { auto tr=T[t1]; int vv[3]={tr.a,tr.b,tr.c};
+            for (int k=0;k<3;++k) if (vv[k]!=e.a && vv[k]!=e.b){ c=vv[k]; break; } }
+            { auto tr=T[t2]; int vv[3]={tr.a,tr.b,tr.c};
+            for (int k=0;k<3;++k) if (vv[k]!=e.a && vv[k]!=e.b){ d=vv[k]; break; } }
+            if (c<0||d<0) continue;
+            if (geom::orient2d_filt(P[e.a],P[e.b],P[c])<=0) continue;
+            if (geom::orient2d_filt(P[e.b],P[e.a],P[d])<=0) continue;
+
+            bool bad = (geom::incircle_filt(P[e.a],P[e.b],P[c],P[d]) > 0.0);
+            if (!bad) continue;
+
+            if (forced.count(EdgeKey(c,d))) continue;
+
+            Tri before1=T[t1], before2=T[t2];
+            if (flipDiagonal(T,P,t1,t2,e.a,e.b)){
+                updateMapsAfterFlip(t1,t2,before1,before2,T,S.M,S.N);
+                updateMapsAfterFlip_v2t(t1, T[t1], S.vert2tri);
+                updateMapsAfterFlip_v2t(t2, T[t2], S.vert2tri);
+                --flip_budget;
+
+                pushIfFree(seeds, c, d, forced);
+                pushIfFree(seeds, e.a, c, forced);
+                pushIfFree(seeds, c, e.b, forced);
+                pushIfFree(seeds, e.b, d, forced);
+                pushIfFree(seeds, d, e.a, forced);
+            }
+        }
+    }
+    
+    inline bool insertConstraintEdge_state(
+        std::vector<Tri>& T, const std::vector<Vec2>& P,
+        int a, int b,
+        const std::unordered_set<EdgeKey, EdgeKeyHash>& forced_set,
+        int& globalFlipBudget,
+        CDTWorkState& S)
+    {
+        if (a == b) return true;
+        if (hasEdge(S.M, a, b)) return true;
+    
+        const Vec2& A = P[a]; const Vec2& B = P[b];
+        auto& C = cfg::get();
+    
+        int t = (a >= 0 && a < (int)S.vert2tri.size() ? S.vert2tri[a] : -1);
+        if (t < 0) t = locateTriangleSlow(T, P, A);
+        if (t < 0) t = 0;
+    
+        int flips = 0;
+        int guard_iters = (int)T.size() * 6 + 64;
+    
+        while (!hasEdge(S.M, a, b))
+        {
+            if (globalFlipBudget <= 0 || flips >= C.max_flips_per_segment) return false;
+            if (--guard_iters <= 0) return false;
+    
+            int eidx = -1; double tAB = 0.0;
+            if (!pickCrossingEdge(t, T, P, A, B, eidx, tAB))
+            {
+                struct Hit { int u, v, t1, t2; double t; };
+                std::vector<Hit> hits; hits.reserve(32);
+                for (const auto& kv : S.M)
+                {
+                    int u = kv.first.u, v = kv.first.v;
+                    if (u == a || v == a || u == b || v == b) continue;
+                    if (forced_set.count(kv.first)) continue;
+                    int t1=-1,t2=-1;
+                    if (!findEdgeTris(S.M, u, v, t1, t2)) continue;
+                    double tp;
+                    if (segmentStrictIntersectAB_E(A, B, P[u], P[v], tp))
+                        hits.push_back({u, v, t1, t2, tp});
+                }
+                if (hits.empty()) return false;
+                std::sort(hits.begin(), hits.end(), [](auto& x, auto& y){return x.t<y.t;});
+                bool did=false;
+                for (const auto& h: hits)
+                {
+                    if (globalFlipBudget <= 0) return false;
+                    if (forced_set.count(EdgeKey(h.u,h.v))) continue;
+                    Tri before1=T[h.t1], before2=T[h.t2];
+                    if (flipDiagonal(T, P, h.t1, h.t2, h.u, h.v))
+                    {
+                        updateMapsAfterFlip(h.t1, h.t2, before1, before2, T, S.M, S.N);
+                        updateMapsAfterFlip_v2t(h.t1, T[h.t1], S.vert2tri);
+                        updateMapsAfterFlip_v2t(h.t2, T[h.t2], S.vert2tri);
+                        ++flips; --globalFlipBudget; did=true;
+    
+                        std::vector<EdgeLocal> seeds;
+                        pushIfFree(seeds, std::min(h.u,h.v), std::max(h.u,h.v), forced_set);
+                        localLegalizeQueue(T, P, forced_set, S, seeds);
+                        break;
+                    }
+                }
+                if (!did) return false;
+                int seed = S.vert2tri[a];
+                t = (seed>=0? seed : locateTriangleSlow(T, P, A));
+                if (t < 0) t = 0;
+                continue;
+            }
+    
+            const Tri& cur = T[t];
+            int V[3] = {cur.a, cur.b, cur.c};
+            int u = V[eidx], v = V[(eidx+1)%3];
+    
+            if (forced_set.count(EdgeKey(u,v)))
+            {
+                int tn = S.N[t][eidx];
+                if (tn < 0) return false;
+                t = tn; continue;
+            }
+    
+            int t1 = t, t2 = S.N[t][eidx];
+            if (t2 < 0)
+            {
+                int tn = S.N[t][eidx];
+                if (tn < 0) return false;
+                t = tn; continue;
+            }
+    
+            Tri before1=T[t1], before2=T[t2];
+            if (flipDiagonal(T, P, t1, t2, u, v))
+            {
+                updateMapsAfterFlip(t1, t2, before1, before2, T, S.M, S.N);
+                updateMapsAfterFlip_v2t(t1, T[t1], S.vert2tri);
+                updateMapsAfterFlip_v2t(t2, T[t2], S.vert2tri);
+                ++flips; --globalFlipBudget;
+    
+                // 국소 합법화
+                std::vector<EdgeLocal> seeds;
+                pushIfFree(seeds, std::min(u,v), std::max(u,v), forced_set);
+                localLegalizeQueue(T, P, forced_set, S, seeds);
+    
+                // A가 들어있는 tri로 재시드
+                int seed = S.vert2tri[a];
+                if (seed>=0) t = seed;
+                else {
+                    t = locateTriangleSlow(T, P, A);
+                    if (t<0) t=0;
+                }
+            }
+            else
+            {
+                int tn = S.N[t][eidx];
+                if (tn < 0) return false;
+                t = tn;
+            }
+        }
+        return true;
+    }
+    
+
+    inline void legalizeCDT(
+        std::vector<Tri>& T,
+        const std::vector<Vec2>& P,
+        const std::unordered_set<EdgeKey, EdgeKeyHash>& forced_set,
+        int max_passes = 3)
     {
         for (int pass = 0; pass < max_passes; ++pass)
         {
             bool changed = false;
-            std::unordered_map<EdgeKey, vector<EdgeRef>, EdgeKeyHash> M;
+    
+            // 패스마다 1회만 구축
+            std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash> M;
             buildEdgeMap(T, M);
-            for (const auto &kv : M)
+            std::vector<NeighArr> N;
+            buildNeighborsFromMap(T, M, N);
+    
+            for (const auto& kv : M)
             {
-                if (forced_set.count(kv.first))
-                    continue;
+                if (forced_set.count(kv.first)) continue;
                 int a = kv.first.u, b = kv.first.v;
+    
                 int t1 = -1, t2 = -1;
-                if (!findEdgeTris(M, a, b, t1, t2))
-                    continue;
-
+                if (!findEdgeTris(M, a, b, t1, t2)) continue;
+    
                 int c = -1, d = -1;
                 {
                     auto tri = T[t1];
-                    int vv[3] = {tri.a, tri.b, tri.c};
-                    for (int k = 0; k < 3; k++)
-                        if (vv[k] != a && vv[k] != b)
-                        {
-                            c = vv[k];
-                            break;
-                        }
+                    int vv[3] = { tri.a, tri.b, tri.c };
+                    for (int k = 0; k < 3; ++k) if (vv[k] != a && vv[k] != b) { c = vv[k]; break; }
                 }
                 {
                     auto tri = T[t2];
-                    int vv[3] = {tri.a, tri.b, tri.c};
-                    for (int k = 0; k < 3; k++)
-                        if (vv[k] != a && vv[k] != b)
-                        {
-                            d = vv[k];
-                            break;
-                        }
+                    int vv[3] = { tri.a, tri.b, tri.c };
+                    for (int k = 0; k < 3; ++k) if (vv[k] != a && vv[k] != b) { d = vv[k]; break; }
                 }
-                if (c == -1 || d == -1)
-                    continue;
-                if (geom::orient2d_filt(P[a], P[b], P[c]) <= 0)
-                    continue;
-                if (geom::orient2d_filt(P[b], P[a], P[d]) <= 0)
-                    continue;
-
+                if (c == -1 || d == -1) continue;
+                if (geom::orient2d_filt(P[a], P[b], P[c]) <= 0) continue; // CCW 가드
+                if (geom::orient2d_filt(P[b], P[a], P[d]) <= 0) continue;
+    
                 bool bad = (geom::incircle_filt(P[a], P[b], P[c], P[d]) > 0.0);
-                if (!bad)
-                    continue;
-
+                if (!bad) continue;
+    
                 EdgeKey newk(c, d);
-                if (forced_set.count(newk))
-                    continue;
-                if (flipDiagonal(T, P, t1, t2, a, b))
+                if (forced_set.count(newk)) continue;
+    
+                if (tryFlipAndUpdate(T, P, t1, t2, a, b, M, N))
                     changed = true;
             }
-            if (!changed)
-                break;
+            if (!changed) break;
         }
     }
 } // namespace delaunay
+
+//============================= CDT with Recovery ============================
+struct Constraint
+{
+    int a, b;
+    int splits = 0;
+};
+
+struct CDTResult
+{
+    vector<geom::Vec2> all;
+    vector<int> label; // 0 inner,1 outer
+    vector<delaunay::Tri> tris;
+    vector<pair<int, int>> forced_edges;
+    bool all_forced_ok = false;
+};
+
+static CDTResult buildCDT_withRecovery(vector<geom::Vec2> inner, vector<geom::Vec2> outer,
+                                       bool enforce_constraints = true)
+{
+    auto &C = cfg::get();
+
+    CDTResult R;
+    R.all = inner;
+    R.all.insert(R.all.end(), outer.begin(), outer.end());
+    R.label.assign(R.all.size(), 0);
+    for (size_t i = 0; i < R.all.size(); ++i)
+        R.label[i] = (i < inner.size() ? 0 : 1);
+
+    if (!enforce_constraints)
+    {
+        R.tris = delaunay::bowyerWatson(R.all);
+        R.forced_edges.clear();
+        R.all_forced_ok = false;
+        return R;
+    }
+
+    auto rebuildDT = [&](vector<delaunay::Tri> &T)
+    { T = delaunay::bowyerWatson(R.all); };
+
+    vector<delaunay::Tri> T;
+    rebuildDT(T);
+
+    delaunay::CDTWorkState S;
+    delaunay::buildState(T, (int)R.all.size(), S);
+
+    vector<Constraint> cons;
+    int nIn = (int)inner.size(), nOut = (int)outer.size();
+    auto pushRing = [&](int base, int n)
+    { for (int i=0;i<n;i++){ int j=(i+1)%n; cons.push_back({base+i, base+j, 0}); } };
+    pushRing(0, nIn);
+    pushRing(nIn, nOut);
+
+    auto rebuildForcedSet = [&](std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash> &F)
+    {
+        F.clear();
+        F.reserve(cons.size() * 2);
+        for (auto &c : cons)
+            F.insert(delaunay::EdgeKey(c.a, c.b));
+    };
+
+    int globalFlipBudget = C.max_global_flips;
+    bool ok = false;
+
+    for (int rebuilds = 0; rebuilds <= C.max_cdt_rebuilds; ++rebuilds)
+    {
+        std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash> forced;
+        rebuildForcedSet(forced);
+
+        ok = true;
+        for (size_t k = 0; k < cons.size(); ++k)
+        {
+            auto &seg = cons[k];
+            if (globalFlipBudget <= 0)
+            {
+                ok = false;
+                break;
+            }
+
+            if (delaunay::insertConstraintEdge_state(T, R.all, seg.a, seg.b, forced, globalFlipBudget, S))
+                continue;
+
+            if (seg.splits >= C.max_segment_splits)
+            {
+                ok = false;
+                break;
+            }
+            geom::Vec2 A = R.all[seg.a], B = R.all[seg.b];
+            geom::Vec2 M = (A + B) * 0.5;
+            int newIdx = (int)R.all.size();
+            R.all.push_back(M);
+            R.label.push_back(R.label[seg.a]);
+
+            Constraint left{seg.a, newIdx, seg.splits + 1};
+            Constraint right{newIdx, seg.b, seg.splits + 1};
+            cons.erase(cons.begin() + k);
+            cons.insert(cons.begin() + k, right);
+            cons.insert(cons.begin() + k, left);
+
+            rebuildDT(T);
+            delaunay::buildState(T, (int)R.all.size(), S); // ★ 상태 재구축
+            rebuildForcedSet(forced);
+            ok = false;
+            break;
+        }
+        if (ok)
+        {
+            delaunay::legalizeCDT(T, R.all, /*forced*/ std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash>(), 1);
+            break;
+        }
+        if (C.verbose)
+            cerr << "[CDT] rebuild " << (rebuilds + 1) << " due to split; total pts=" << R.all.size() << "\n";
+        if (rebuilds == C.max_cdt_rebuilds)
+            break;
+    }
+
+    R.tris = std::move(T);
+    R.all_forced_ok = ok;
+
+    R.forced_edges.clear();
+    R.forced_edges.reserve(cons.size());
+    for (const auto &c : cons)
+        R.forced_edges.push_back({c.a, c.b});
+
+    return R;
+}
 
 //=========================== Clip & Quality Filter =========================
 namespace clip
@@ -1916,128 +2363,6 @@ namespace io
     }
 } // namespace io
 
-//============================= CDT with Recovery ============================
-struct Constraint
-{
-    int a, b;
-    int splits = 0;
-};
-
-struct CDTResult
-{
-    vector<geom::Vec2> all;
-    vector<int> label; // 0 inner,1 outer
-    vector<delaunay::Tri> tris;
-    vector<pair<int, int>> forced_edges;
-    bool all_forced_ok = false;
-};
-
-static CDTResult buildCDT_withRecovery(vector<geom::Vec2> inner, vector<geom::Vec2> outer,
-                                       bool enforce_constraints = true)
-{
-    auto &C = cfg::get();
-
-    CDTResult R;
-    R.all = inner;
-    R.all.insert(R.all.end(), outer.begin(), outer.end());
-    R.label.assign(R.all.size(), 0);
-    for (size_t i = 0; i < R.all.size(); ++i)
-        R.label[i] = (i < inner.size() ? 0 : 1);
-
-    if (!enforce_constraints)
-    {
-        R.tris = delaunay::bowyerWatson(R.all);
-        R.forced_edges.clear();
-        R.all_forced_ok = false;
-        return R;
-    }
-
-    auto rebuildDT = [&](vector<delaunay::Tri> &T)
-    { T = delaunay::bowyerWatson(R.all); };
-
-    vector<delaunay::Tri> T;
-    rebuildDT(T);
-
-    vector<Constraint> cons;
-    int nIn = (int)inner.size(), nOut = (int)outer.size();
-    auto pushRing = [&](int base, int n)
-    { for (int i=0;i<n;i++){ int j=(i+1)%n; cons.push_back({base+i, base+j, 0}); } };
-    pushRing(0, nIn);
-    pushRing(nIn, nOut);
-
-    auto rebuildForcedSet = [&](std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash> &F)
-    {
-        F.clear();
-        F.reserve(cons.size() * 2);
-        for (auto &c : cons)
-            F.insert(delaunay::EdgeKey(c.a, c.b));
-    };
-
-    int globalFlipBudget = C.max_global_flips;
-    bool ok = false;
-
-    for (int rebuilds = 0; rebuilds <= C.max_cdt_rebuilds; ++rebuilds)
-    {
-        std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash> forced;
-        rebuildForcedSet(forced);
-
-        ok = true;
-        for (size_t k = 0; k < cons.size(); ++k)
-        {
-            auto &seg = cons[k];
-            if (globalFlipBudget <= 0)
-            {
-                ok = false;
-                break;
-            }
-
-            if (delaunay::insertConstraintEdge(T, R.all, seg.a, seg.b, forced, globalFlipBudget))
-                continue;
-
-            if (seg.splits >= C.max_segment_splits)
-            {
-                ok = false;
-                break;
-            }
-            geom::Vec2 A = R.all[seg.a], B = R.all[seg.b];
-            geom::Vec2 M = (A + B) * 0.5;
-            int newIdx = (int)R.all.size();
-            R.all.push_back(M);
-            R.label.push_back(R.label[seg.a]);
-
-            Constraint left{seg.a, newIdx, seg.splits + 1};
-            Constraint right{newIdx, seg.b, seg.splits + 1};
-            cons.erase(cons.begin() + k);
-            cons.insert(cons.begin() + k, right);
-            cons.insert(cons.begin() + k, left);
-
-            rebuildDT(T);
-            rebuildForcedSet(forced);
-            ok = false;
-            break;
-        }
-        if (ok)
-        {
-            delaunay::legalizeCDT(T, R.all, /*forced*/ std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash>(), 2);
-            break;
-        }
-        if (C.verbose)
-            cerr << "[CDT] rebuild " << (rebuilds + 1) << " due to split; total pts=" << R.all.size() << "\n";
-        if (rebuilds == C.max_cdt_rebuilds)
-            break;
-    }
-
-    R.tris = std::move(T);
-    R.all_forced_ok = ok;
-
-    R.forced_edges.clear();
-    R.forced_edges.reserve(cons.size());
-    for (const auto &c : cons)
-        R.forced_edges.push_back({c.a, c.b});
-
-    return R;
-}
-
 //============================ Ray–Segment Utils ============================
 // 레이 A + t*d 와 세그먼트 S0 + u*(S1-S0) 교차 (t>=0, u∈[0,1])
 static bool rayIntersectSegment(const geom::Vec2 &A, const geom::Vec2 &d,
@@ -2527,22 +2852,19 @@ int main(int argc, char **argv)
         const auto &outerE = closed_mode ? outerEdgesClosed : outerEdgesOpen;
 
         std::ofstream fo2(base + "_with_geom.csv");
-        if (!fo2)
-        {
-            cerr << "[ERR] save centerline_with_geom\n";
-            return 6;
-        }
+        if (!fo2) { cerr << "[ERR] save centerline_with_geom\n"; return 6; }
         fo2.setf(std::ios::fixed);
         fo2.precision(9);
-        fo2 << "s,x,y,heading_rad,curvature,dist_to_inner,dist_to_outer,width\n";
 
-        double x0 = 0, y0 = 0, hd0 = 0, k0 = 0, din0 = 0, dout0 = 0, w0 = 0;
+        // ▼▼▼ 헤더에 v_kappa_mps 추가 ▼▼▼
+        fo2 << "s,x,y,heading_rad,curvature,dist_to_inner,dist_to_outer,width,v_kappa_mps\n";
+
+        double x0=0, y0=0, hd0=0, k0=0, din0=0, dout0=0, w0=0, v0=0;  // v0 추가
         const int Ncenter = (int)center.size();
         const int Kmax = closed_mode ? C.samples : Ncenter;
         const int denomN = closed_mode ? C.samples : std::max(1, C.samples);
 
-        for (int k = 0; k < Kmax; ++k)
-        {
+        for (int k = 0; k < Kmax; ++k) {
             double si = s0 + L * (double(k) / double(denomN));
             double x, xp, xpp, y, yp, ypp;
             spx.eval_with_deriv(si, x, xp, xpp);
@@ -2556,38 +2878,36 @@ int main(int argc, char **argv)
             geom::Vec2 nvec = geom::normalize(geom::Vec2{-yp, xp}, 1e-12);
             double d_in = std::numeric_limits<double>::infinity();
             double d_out = std::numeric_limits<double>::infinity();
-            if (nvec.x != 0 || nvec.y != 0)
-            {
+            if (nvec.x != 0 || nvec.y != 0) {
                 geom::Vec2 P{x, y};
                 distancesToRings(P, nvec, innerE, outerE, d_in, d_out);
             }
-            if (!std::isfinite(d_in))
-                d_in = 0.0;
-            if (!std::isfinite(d_out))
-                d_out = 0.0;
+            if (!std::isfinite(d_in))  d_in  = 0.0;
+            if (!std::isfinite(d_out)) d_out = 0.0;
 
             double width = d_in + d_out;
             double si_rel = si - s0;
 
-            if (k == 0)
-            {
-                x0 = x;
-                y0 = y;
-                hd0 = heading;
-                k0 = curvature;
-                din0 = d_in;
-                dout0 = d_out;
-                w0 = width;
+            // ▼▼▼ v_kappa 계산 및 캡 ▼▼▼
+            double denom_k = std::max(std::fabs(curvature), C.kappa_eps);
+            double v_kappa = std::sqrt(C.a_lat_max / denom_k);
+            if (v_kappa > C.v_cap_mps) v_kappa = C.v_cap_mps;
+
+            if (k == 0) {
+                x0=x; y0=y; hd0=heading; k0=curvature; din0=d_in; dout0=d_out; w0=width; v0=v_kappa; // v0 저장
             }
+
+            // ▼▼▼ CSV에 v_kappa_mps 추가 ▼▼▼
             fo2 << si_rel << "," << x << "," << y << "," << heading << "," << curvature
-                << "," << d_in << "," << d_out << "," << width << "\n";
+                << "," << d_in << "," << d_out << "," << width << "," << v_kappa << "\n";
         }
-        if (C.emit_closed_duplicate)
-        {
+
+        if (C.emit_closed_duplicate) {
             fo2 << L << "," << x0 << "," << y0 << "," << hd0 << "," << k0
-                << "," << din0 << "," << dout0 << "," << w0 << "\n";
+                << "," << din0 << "," << dout0 << "," << w0 << "," << v0 << "\n"; // v0도 복제
         }
     }
+
 
     // [10] 최소 곡률 raceline (최적화)
     std::vector<geom::Vec2> center_for_opt = center;
@@ -2628,26 +2948,36 @@ int main(int argc, char **argv)
         // with geom
         {
             std::ofstream fo(base + "_raceline_with_geom.csv");
-            if (!fo)
-            {
-                cerr << "[ERR] save raceline_with_geom\n";
-                return 8;
-            }
+            if (!fo) { cerr << "[ERR] save raceline_with_geom\n"; return 8; }
             fo.setf(std::ios::fixed);
             fo.precision(9);
-            fo << "s,x,y,heading_rad,curvature,alpha_last\n";
+
+            // ▼▼▼ 헤더에 v_kappa_mps 추가 ▼▼▼
+            fo << "s,x,y,heading_rad,curvature,alpha_last,v_kappa_mps\n";
+
             const int Nrl = (int)res.raceline.size();
-            for (int k = 0; k < Nrl; ++k)
-            {
+            for (int k = 0; k < Nrl; ++k) {
                 double si = s0 + L * (double(k) / double(Nrl));
                 double si_rel = si - s0;
+
+                // ▼▼▼ v_kappa 계산 및 캡 (raceline 곡률 사용) ▼▼▼
+                double denom_k = std::max(std::fabs(res.curvature[k]), C.kappa_eps);
+                double v_kappa = std::sqrt(C.a_lat_max / denom_k);
+                if (v_kappa > C.v_cap_mps) v_kappa = C.v_cap_mps;
+
                 fo << si_rel << "," << res.raceline[k].x << "," << res.raceline[k].y << ","
-                   << res.heading[k] << "," << res.curvature[k] << "," << res.alpha_last[k] << "\n";
+                << res.heading[k] << "," << res.curvature[k] << "," << res.alpha_last[k] << ","
+                << v_kappa << "\n";
             }
-            if (C.emit_closed_duplicate && !res.raceline.empty())
-            {
+            if (C.emit_closed_duplicate && !res.raceline.empty()) {
+                // 첫 샘플의 v_kappa 재계산
+                double denom_k0 = std::max(std::fabs(res.curvature[0]), C.kappa_eps);
+                double v0 = std::sqrt(C.a_lat_max / denom_k0);
+                if (v0 > C.v_cap_mps) v0 = C.v_cap_mps;
+
                 fo << L << "," << res.raceline[0].x << "," << res.raceline[0].y << ","
-                   << res.heading[0] << "," << res.curvature[0] << "," << res.alpha_last[0] << "\n";
+                << res.heading[0] << "," << res.curvature[0] << "," << res.alpha_last[0] << ","
+                << v0 << "\n";
             }
         }
     }
