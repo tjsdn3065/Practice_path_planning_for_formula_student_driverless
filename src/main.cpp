@@ -4,16 +4,15 @@
 //  - is_closed_track=true/false 로 알고리즘 모드 선택
 //  - emit_closed_duplicate=true  → 출력 CSV에 마지막 샘플을 첫 샘플로 복제
 // ---------------------------------------------------------------------------
-// Pipeline (paper-aligned):
-//  1) 입력 링(inner/outer) -> Delaunay -> CDT(제약 강제/복구) [open일 땐 제약 없이 BW만]
-//  2) 트랙 영역 클리핑(+품질 필터) [open일 땐 생략]
-//  3) 내/외부 라벨 경계 엣지의 중점 추출
-//  4) MST 지름 경로 기반 순서화
-//  5) 자연 3차 스플라인(TDMA) + 경계 패딩 -> 균일 arc-length 재샘플
-//  6) 각 샘플점에서 법선으로 inner/outer까지 거리 -> 코리도 폭 w_L, w_R
-//  7) 최소 곡률(∑κ^2 + λ||D1α||^2) 최소화,  lo ≤ α ≤ hi  (α: 법선 오프셋)
+// Pipeline (DT-only):
+//  1) 입력 링(inner/outer) -> Delaunay(Bowyer–Watson)
+//  2) 내/외부 라벨 경계 엣지의 중점 추출(+길이 필터)
+//  3) MST 지름 경로 기반 중점 순서화 + 방향/시작점 정합(OPEN/폐곡 규칙)
+//  4) 자연 3차 스플라인(TDMA) + 경계 패딩 -> 균일 arc-length 재샘플
+//  5) 각 샘플점에서 법선으로 inner/outer까지 거리 -> 코리도 폭 w_L, w_R
+//  6) 최소 곡률(∑κ^2 + λ||D1α||^2) 최소화,  lo ≤ α ≤ hi  (α: 법선 오프셋)
 //     - GN(선형화) - projected step - outer relinearization
-//  8) 결과 저장 (centerline.csv, *_with_geom.csv, *_raceline*.csv)
+//  7) 결과 저장 (centerline.csv, *_with_geom.csv, *_raceline*.csv)
 // ============================================================================
 
 #include <algorithm>
@@ -59,8 +58,8 @@ namespace cfg
         double current_pos_x = 4.994457593, current_pos_y = -0.108866966; // 차량 현재 위치(오픈 트랙용)
         // 헤딩 라디안: +x가 0rad, CCW가 + 방향 (표준 수학 좌표계)
         double current_heading_rad = 0.046698693;
-        double start_anchor_x = 0.0, start_anchor_y = 0.0; // 초기(시작) 위치(폐루프 시작 회전용)
-        double start_heading_rad = 0.0;               // 초기(시작) 헤딩(폐루프 시작 회전용)
+        double start_anchor_x = 0.0, start_anchor_y = 0.0; // 초기(시작) 위치(폐루프 회전/정렬용)
+        double start_heading_rad = 0.0;                     // 초기(시작) 헤딩(폐루프 방향 정합용)
 
         // 알고리즘 모드(트랙 폐루프 여부)
         bool is_closed_track = true;
@@ -68,12 +67,7 @@ namespace cfg
         // 출력 옵션: 폐루프 시 마지막 샘플 = 첫 샘플 복제 여부
         bool emit_closed_duplicate = true;
 
-        bool auto_order_rings = false; // 입력 링(콘 좌표) 자동 정렬
-        int nn_k_order = 8;           // NN 경로에서 후보 이웃 수
-        int two_opt_iters = 2000;     // 2-opt 개선 횟수
-
         // 전처리/샘플링
-        double dedup_eps = 1e-12;
         bool add_micro_jitter = true;
         double jitter_eps = 1e-9;
 
@@ -85,26 +79,10 @@ namespace cfg
 
         int knn_k = 8; // MST k-NN
 
-        // CDT 강제삽입/복구 가드
-        int max_flips_per_segment = 20000;
-        int max_global_flips = 500000;
-        int max_segment_splits = 8;
-        int max_cdt_rebuilds = 12;
-        bool verbose = true;
-
-        // 삼각형 품질 필터
-        bool enable_quality_filter = true;
-        double min_triangle_area = 1e-10;    // 면적 하한
-        double min_triangle_angle_deg = 5.0; // 최소 내각(deg)
-        double max_edge_length_scale = 5.0;  // 중앙값 대비 엣지 길이 상한 배수
-
-        // 클리핑 실패 시 전체 사용 허용
-        bool allow_fallback_clip = true;
-
-        bool dump_boundary_edge_lengths = false; // 경계 엣지 길이 CSV/통계 덤프
-        bool enable_boundary_len_filter = true;  // 길이 필터 적용 여부
-        double boundary_edge_len_scale = 2.0;    // 길이 컷오프 = scale * 중앙값
-        double boundary_edge_abs_max = 6.0;      // 절대 상한(미사용하려면 크게)
+        // 길이 필터
+        bool enable_boundary_len_filter = true;
+        double boundary_edge_len_scale = 2.0; // 길이 컷오프 = scale * 중앙값
+        double boundary_edge_abs_max = 6.0;   // 절대 상한(미사용하려면 크게)
 
         // 차량 폭/마진 (코리도 가드)
         double veh_width_m = 1.0;
@@ -118,9 +96,9 @@ namespace cfg
         double step_min = 1e-6;      // 최소 스텝
         double armijo_c = 1e-5;      // Armijo 계수
 
-        double a_lat_max    = 10.0;   // A_LAT_MAX
-        double kappa_eps    = 1e-6;   // KAPPA_EPS
-        double v_cap_mps    = 27.0;   // 최대 속도 캡
+        double a_lat_max = 10.0;   // A_LAT_MAX
+        double kappa_eps = 1e-6;   // KAPPA_EPS
+        double v_cap_mps = 27.0;   // 최대 속도 캡
     };
     inline Config &get()
     {
@@ -173,11 +151,6 @@ namespace geom
         long double detl = adx * bdy - ady * bdx;
         return (double)detl;
     }
-    inline int orientSign(const Vec2 &a, const Vec2 &b, const Vec2 &c)
-    {
-        double v = orient2d_filt(a, b, c);
-        return (v > 0) - (v < 0);
-    }
     inline double incircle_filt(const Vec2 &a, const Vec2 &b, const Vec2 &c, const Vec2 &d)
     {
         double adx = a.x - d.x, ady = a.y - d.y;
@@ -198,242 +171,7 @@ namespace geom
 
     inline bool ccw(const Vec2 &A, const Vec2 &B, const Vec2 &C) { return orient2d_filt(A, B, C) > 0; }
 
-    inline bool segIntersectProper(const Vec2 &a, const Vec2 &b, const Vec2 &c, const Vec2 &d)
-    {
-        int s1 = orientSign(a, b, c), s2 = orientSign(a, b, d), s3 = orientSign(c, d, a), s4 = orientSign(c, d, b);
-        if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0)
-        {
-            auto mm = [](double u, double v)
-            { if(u>v) std::swap(u,v); return std::make_pair(u,v); };
-            auto [ax, bx] = mm(a.x, b.x);
-            auto [cx, dx] = mm(c.x, d.x);
-            auto [ay, by] = mm(a.y, b.y);
-            auto [cy, dy] = mm(c.y, d.y);
-            bool strict = (bx > cx && dx > ax && by > cy && dy > ay);
-            return strict;
-        }
-        return (s1 * s2 < 0 && s3 * s4 < 0);
-    }
-    inline bool pointInPoly(const vector<Vec2> &poly, const Vec2 &p)
-    {
-        bool inside = false;
-        int n = (int)poly.size();
-        for (int i = 0, j = n - 1; i < n; j = i++)
-        {
-            const Vec2 &a = poly[j], &b = poly[i];
-            bool cond = ((a.y > p.y) != (b.y > p.y)) && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y + 1e-30) + a.x);
-            if (cond)
-                inside = !inside;
-        }
-        return inside;
-    }
-    inline double triArea2(const Vec2 &A, const Vec2 &B, const Vec2 &C)
-    {
-        return std::fabs(orient2d_filt(A, B, C));
-    }
-    inline double angleAt(const Vec2 &A, const Vec2 &B, const Vec2 &C)
-    {
-        Vec2 u = A - B, v = C - B;
-        double nu = norm(u), nv = norm(v);
-        if (nu * nv < 1e-30)
-            return 0.0;
-        double c = std::clamp(dot(u, v) / (nu * nv), -1.0, 1.0);
-        return std::acos(c);
-    }
 } // namespace geom
-
-//=========================== Orientation Utils (NEW) =======================
-namespace orient
-{
-    using geom::Vec2;
-
-    inline double signedArea(const std::vector<Vec2> &R)
-    {
-        int n = (int)R.size();
-        if (n < 3)
-            return 0.0;
-        long double A = 0.0L;
-        for (int i = 0; i < n; ++i)
-        {
-            const auto &p = R[i];
-            const auto &q = R[(i + 1) % n];
-            A += (long double)p.x * (long double)q.y - (long double)q.x * (long double)p.y;
-        }
-        return (double)(0.5L * A); // + : CCW,  - : CW
-    }
-
-    inline void ensure_ccw(std::vector<Vec2> &R)
-    {
-        if (signedArea(R) < 0.0)
-            std::reverse(R.begin(), R.end());
-    }
-    inline void ensure_cw(std::vector<Vec2> &R)
-    {
-        if (signedArea(R) > 0.0)
-            std::reverse(R.begin(), R.end());
-    }
-
-    // Open 코리도(outer→inner^rev) 면적: +면 CCW
-    inline double signedAreaCorridorOpen(const std::vector<Vec2> &inner,
-                                         const std::vector<Vec2> &outer)
-    {
-        int m = (int)outer.size(), n = (int)inner.size();
-        if (m < 2 || n < 2)
-            return 0.0;
-        long double A = 0.0L;
-        auto add = [&](const Vec2 &p, const Vec2 &q)
-        {
-            A += (long double)p.x * (long double)q.y - (long double)q.x * (long double)p.y;
-        };
-        for (int i = 0; i + 1 < m; ++i)
-            add(outer[i], outer[i + 1]);
-        add(outer[m - 1], inner[n - 1]);
-        for (int i = n - 1; i >= 1; --i)
-            add(inner[i], inner[i - 1]);
-        add(inner[0], outer[0]);
-        return (double)(0.5L * A);
-    }
-} // namespace orient
-
-//============================== pre-ordering ===================================
-namespace ordering
-{
-    using geom::Vec2;
-
-    inline double dist(const Vec2 &a, const Vec2 &b)
-    {
-        double dx = a.x - b.x, dy = a.y - b.y;
-        return std::sqrt(dx * dx + dy * dy);
-    }
-
-    // 간단 2-opt
-    inline void two_opt_improve(std::vector<int> &ord,
-                                const std::vector<Vec2> &P,
-                                int max_iters = 2000)
-    {
-        int n = (int)ord.size();
-        if (n < 4)
-            return;
-        auto seglen = [&](int i, int j)
-        {
-            const Vec2 &A = P[ord[i]];
-            const Vec2 &B = P[ord[j]];
-            return dist(A, B);
-        };
-        for (int it = 0; it < max_iters; ++it)
-        {
-            bool improved = false;
-            for (int i = 0; i < n - 3 && !improved; ++i)
-            {
-                for (int j = i + 2; j < n - 1; ++j)
-                {
-                    double d0 = seglen(i, i + 1) + seglen(j, j + 1);
-                    double d1 = seglen(i, j) + seglen(i + 1, j + 1);
-                    if (d1 + 1e-12 < d0)
-                    {
-                        std::reverse(ord.begin() + i + 1, ord.begin() + j + 1);
-                        improved = true;
-                        break;
-                    }
-                }
-            }
-            if (!improved)
-                break;
-        }
-    }
-
-    inline std::vector<geom::Vec2>
-    order_closed_by_angle_then_2opt(const std::vector<geom::Vec2> &pts,
-                                    int two_opt_iters)
-    {
-        int n = (int)pts.size();
-        if (n <= 2)
-            return pts;
-        geom::Vec2 c{0, 0};
-        for (auto &p : pts)
-        {
-            c.x += p.x;
-            c.y += p.y;
-        }
-        c.x /= n;
-        c.y /= n;
-
-        std::vector<int> ord(n);
-        std::iota(ord.begin(), ord.end(), 0);
-        std::sort(ord.begin(), ord.end(), [&](int i, int j)
-                  {
-                      double ai=std::atan2(pts[i].y-c.y, pts[i].x-c.x);
-                      double aj=std::atan2(pts[j].y-c.y, pts[j].x-c.x);
-                      return ai<aj; });
-
-        ordering::two_opt_improve(ord, pts, two_opt_iters);
-
-        std::vector<geom::Vec2> out;
-        out.reserve(n);
-        for (int i : ord)
-            out.push_back(pts[i]);
-        return out;
-    }
-
-    inline std::vector<geom::Vec2>
-    order_open_by_nn_then_2opt(const std::vector<geom::Vec2> &pts,
-                               int two_opt_iters)
-    {
-        int n = (int)pts.size();
-        if (n <= 2)
-            return pts;
-
-        int start = 0;
-        for (int i = 1; i < n; ++i)
-        {
-            if (pts[i].x < pts[start].x - 1e-12 ||
-                (std::fabs(pts[i].x - pts[start].x) < 1e-12 && pts[i].y < pts[start].y))
-                start = i;
-        }
-
-        std::vector<char> used(n, 0);
-        std::vector<int> ord;
-        ord.reserve(n);
-        ord.push_back(start);
-        used[start] = 1;
-
-        for (int step = 1; step < n; ++step)
-        {
-            int cur = ord.back();
-            int best = -1;
-            double bestd = 1e300;
-            for (int j = 0; j < n; ++j)
-                if (!used[j])
-                {
-                    double d = ordering::dist(pts[cur], pts[j]);
-                    if (d < bestd)
-                    {
-                        bestd = d;
-                        best = j;
-                    }
-                }
-            if (best == -1)
-            {
-                for (int j = 0; j < n; ++j)
-                    if (!used[j])
-                    {
-                        best = j;
-                        break;
-                    }
-            }
-            ord.push_back(best);
-            used[best] = 1;
-        }
-
-        ordering::two_opt_improve(ord, pts, two_opt_iters);
-
-        std::vector<geom::Vec2> out;
-        out.reserve(n);
-        for (int i : ord)
-            out.push_back(pts[i]);
-        return out;
-    }
-} // namespace ordering
 
 //============================== Delaunay / CDT =============================
 namespace delaunay
@@ -581,688 +319,9 @@ namespace delaunay
             }
         }
     }
-    inline bool hasEdge(const std::unordered_map<EdgeKey, vector<EdgeRef>, EdgeKeyHash> &M, int a, int b)
-    {
-        auto it = M.find(EdgeKey(a, b));
-        return (it != M.end() && !it->second.empty());
-    }
-    inline bool findEdgeTris(const std::unordered_map<EdgeKey, vector<EdgeRef>, EdgeKeyHash> &M, int a, int b, int &t1, int &t2)
-    {
-        auto it = M.find(EdgeKey(a, b));
-        if (it == M.end())
-            return false;
-        const auto &vec = it->second;
-        int found = 0;
-        t1 = -1;
-        t2 = -1;
-        for (const auto &er : vec)
-        {
-            if ((er.a == a && er.b == b) || (er.a == b && er.b == a))
-            {
-                if (found == 0)
-                {
-                    t1 = er.tri;
-                    found = 1;
-                }
-                else if (er.tri != t1)
-                {
-                    t2 = er.tri;
-                    found = 2;
-                    break;
-                }
-            }
-        }
-        if (found < 2)
-        {
-            for (const auto &er : vec)
-            {
-                if (er.tri != t1)
-                {
-                    if (found == 0)
-                    {
-                        t1 = er.tri;
-                        found = 1;
-                    }
-                    else
-                    {
-                        t2 = er.tri;
-                        found = 2;
-                        break;
-                    }
-                }
-            }
-        }
-        return (found == 2);
-    }
-    inline bool flipDiagonal(vector<Tri> &T, const vector<Vec2> &P, int t1, int t2, int u, int v)
-    {
-        int a1 = T[t1].a, b1 = T[t1].b, c1 = T[t1].c;
-        int c = -1;
-        if (a1 != u && a1 != v)
-            c = a1;
-        if (b1 != u && b1 != v)
-            c = b1;
-        if (c1 != u && c1 != v)
-            c = c1;
-        int a2 = T[t2].a, b2 = T[t2].b, c2 = T[t2].c;
-        int d = -1;
-        if (a2 != u && a2 != v)
-            d = a2;
-        if (b2 != u && b2 != v)
-            d = b2;
-        if (c2 != u && c2 != v)
-            d = c2;
-        if (c == -1 || d == -1)
-            return false;
-
-        if (geom::orient2d_filt(P[u], P[v], P[c]) <= 0)
-            return false;
-        if (geom::orient2d_filt(P[v], P[u], P[d]) <= 0)
-            return false;
-
-        Tri Tleft = {c, d, v};
-        if (!geom::ccw(P[Tleft.a], P[Tleft.b], P[Tleft.c]))
-            std::swap(Tleft.b, Tleft.c);
-        Tri Tright = {d, c, u};
-        if (!geom::ccw(P[Tright.a], P[Tright.b], P[Tright.c]))
-            std::swap(Tright.b, Tright.c);
-
-        T[t1] = Tleft;
-        T[t2] = Tright;
-        return true;
-    }
-    inline bool intersectParamT(const Vec2 &A, const Vec2 &B, const Vec2 &C, const Vec2 &D, double &t)
-    {
-        double x1 = A.x, y1 = A.y, x2 = B.x, y2 = B.y;
-        double x3 = C.x, y3 = C.y, x4 = D.x, y4 = D.y;
-        double den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
-        if (std::fabs(den) < 1e-20)
-            return false;
-        double tnum = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4);
-        double unum = (x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2);
-        t = tnum / den;
-        double u = unum / den;
-        return (t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0);
-    }
-    // ===== Neighbors: 삼각형 이웃 관리 =====
-    using NeighArr = std::array<int, 3>; // 각 삼각형의 이웃 tri index, 없으면 -1
-
-    static inline int edgeIndexInTri(const Tri& tr, int u, int v)
-    {
-        int A[3] = { tr.a, tr.b, tr.c };
-        for (int i = 0; i < 3; ++i)
-        {
-            int x = A[i], y = A[(i + 1) % 3];
-            if ((x == u && y == v) || (x == v && y == u))
-                return i;
-        }
-        return -1;
-    }
-
-    static inline void buildNeighborsFromMap(
-        const std::vector<Tri>& T,
-        const std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
-        std::vector<NeighArr>& N)
-    {
-        N.assign(T.size(), NeighArr{ -1, -1, -1 });
-        for (int tid = 0; tid < (int)T.size(); ++tid)
-        {
-            const Tri& tr = T[tid];
-            int A[3] = { tr.a, tr.b, tr.c };
-            for (int i = 0; i < 3; ++i)
-            {
-                int u = A[i], v = A[(i + 1) % 3];
-                auto it = M.find(EdgeKey(u, v));
-                if (it == M.end()) continue;
-                int other = -1;
-                for (const auto& er : it->second)
-                    if (er.tri != tid) { other = er.tri; break; }
-                N[tid][i] = other;
-            }
-        }
-        // 역참조 보정
-        for (int tid = 0; tid < (int)T.size(); ++tid)
-        {
-            const Tri& tr = T[tid];
-            for (int ei = 0; ei < 3; ++ei)
-            {
-                int t2 = N[tid][ei];
-                if (t2 < 0) continue;
-                const Tri& tr2 = T[t2];
-                int A[3] = { tr.a, tr.b, tr.c };
-                int u = A[ei], v = A[(ei + 1) % 3];
-                int e2 = edgeIndexInTri(tr2, v, u); // 반대 방향
-                if (e2 >= 0)
-                    N[t2][e2] = tid;
-            }
-        }
-    }
-
-    // ----- Reusable state -----
-    struct CDTWorkState {
-        std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash> M; // edge -> tris(<=2)
-        std::vector<NeighArr> N;      // tri neighbors
-        std::vector<int> vert2tri;    // vertex -> any incident triangle id (or -1)
-    };
-
-    static inline void buildVert2Tri(const std::vector<Tri>& T, int nVerts, std::vector<int>& v2t){
-        v2t.assign(nVerts, -1);
-        for (int tid = 0; tid < (int)T.size(); ++tid){
-            const Tri& tr = T[tid];
-            if (tr.a >=0 && tr.a<nVerts && v2t[tr.a] == -1) v2t[tr.a] = tid;
-            if (tr.b >=0 && tr.b<nVerts && v2t[tr.b] == -1) v2t[tr.b] = tid;
-            if (tr.c >=0 && tr.c<nVerts && v2t[tr.c] == -1) v2t[tr.c] = tid;
-        }
-    }
-
-    static inline void buildState(const std::vector<Tri>& T, int nVerts, CDTWorkState& S){
-        buildEdgeMap(T, S.M);
-        buildNeighborsFromMap(T, S.M, S.N);
-        buildVert2Tri(T, nVerts, S.vert2tri);
-    }
-
-    // flip 후 vert2tri 갱신
-    static inline void updateMapsAfterFlip_v2t(int tid, const Tri& tri, std::vector<int>& v2t){
-        if (tri.a >= 0 && tri.a < (int)v2t.size()) v2t[tri.a] = tid;
-        if (tri.b >= 0 && tri.b < (int)v2t.size()) v2t[tri.b] = tid;
-        if (tri.c >= 0 && tri.c < (int)v2t.size()) v2t[tri.c] = tid;
-    }
-
-    static inline void rebuildLocalNeighborsForTri(
-        int tid,
-        const std::vector<Tri>& T,
-        const std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
-        std::vector<NeighArr>& N)
-    {
-        const Tri& tr = T[tid];
-        int A[3] = { tr.a, tr.b, tr.c };
-        for (int i = 0; i < 3; ++i)
-        {
-            int u = A[i], v = A[(i + 1) % 3];
-            int other = -1;
-            auto it = M.find(EdgeKey(u, v));
-            if (it != M.end())
-            {
-                for (const auto& er : it->second)
-                    if (er.tri != tid) { other = er.tri; break; }
-            }
-            N[tid][i] = other;
-            if (other >= 0)
-            {
-                int e2 = edgeIndexInTri(T[other], v, u);
-                if (e2 >= 0)
-                    N[other][e2] = tid;
-            }
-        }
-    }
-
-    // 점이 삼각형 내부/경계에 있는지(부동소수 안정) 
-    static inline bool pointInTriOrOnEdge(
-        const Vec2& p, const Vec2& a, const Vec2& b, const Vec2& c, double eps = 1e-15)
-    {
-        double s1 = geom::orient2d_filt(a, b, p);
-        double s2 = geom::orient2d_filt(b, c, p);
-        double s3 = geom::orient2d_filt(c, a, p);
-        bool hasNeg = (s1 < -eps) || (s2 < -eps) || (s3 < -eps);
-        bool hasPos = (s1 > +eps) || (s2 > +eps) || (s3 > +eps);
-        return !(hasNeg && hasPos);
-    }
-
-    // (A,B) 세그먼트가 (U,V)와 내부에서 교차하는지
-    static inline bool segmentStrictIntersectAB_E(
-        const Vec2& A, const Vec2& B, const Vec2& U, const Vec2& V, double& tAB, double tiny = 1e-12)
-    {
-        double t;
-        if (!intersectParamT(A, B, U, V, t)) return false;
-        if (t <= tiny || t >= 1.0 - tiny) return false;
-        tAB = t;
-        return true;
-    }
-
-    // A를 포함하는 삼각형을 느리지만 안전하게 찾기(선형검색)
-    static inline int locateTriangleSlow(const std::vector<Tri>& T, const std::vector<Vec2>& P, const Vec2& X)
-    {
-        for (int tid = 0; tid < (int)T.size(); ++tid)
-        {
-            const Tri& tr = T[tid];
-            if (pointInTriOrOnEdge(X, P[tr.a], P[tr.b], P[tr.c]))
-                return tid;
-        }
-        return -1;
-    }
-
-    // A->B가 현재 삼각형 t에서 어떤 엣지로 나가는지 선택
-    static inline bool pickCrossingEdge(
-        int t, const std::vector<Tri>& T, const std::vector<Vec2>& P,
-        const Vec2& A, const Vec2& B, int& eidx_out, double& tab_out)
-    {
-        const Tri& tr = T[t];
-        int V[3] = { tr.a, tr.b, tr.c };
-        const Vec2 E0 = P[V[0]], E1 = P[V[1]], E2 = P[V[2]];
-        struct Cand { int e; double t; };
-        std::vector<Cand> cand; cand.reserve(3);
-
-        double t0;
-        if (segmentStrictIntersectAB_E(A, B, E0, E1, t0)) cand.push_back({ 0, t0 });
-        if (segmentStrictIntersectAB_E(A, B, E1, E2, t0)) cand.push_back({ 1, t0 });
-        if (segmentStrictIntersectAB_E(A, B, E2, E0, t0)) cand.push_back({ 2, t0 });
-
-        if (cand.empty()) return false;
-        std::sort(cand.begin(), cand.end(), [](const Cand& x, const Cand& y) { return x.t < y.t; });
-        eidx_out = cand.front().e;
-        tab_out = cand.front().t;
-        return true;
-    }
-
-    // (NEW) 플립 후 엣지맵/이웃 국소 갱신
-    static inline void updateMapsAfterFlip(
-        const int t1, const int t2,
-        const Tri& old1, const Tri& old2,
-        std::vector<Tri>& T,
-        std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
-        std::vector<NeighArr>& N)
-    {
-        auto removeTriEdges = [&](int tid, const Tri& tri)
-        {
-            int A[3] = { tri.a, tri.b, tri.c };
-            for (int i = 0; i < 3; ++i)
-            {
-                EdgeKey k(A[i], A[(i + 1) % 3]);
-                auto it = M.find(k);
-                if (it == M.end()) continue;
-                auto& vec = it->second;
-                vec.erase(std::remove_if(vec.begin(), vec.end(),
-                    [&](const EdgeRef& er)
-                    {
-                        return (er.tri == tid) &&
-                            ((er.a == A[i] && er.b == A[(i + 1) % 3]) ||
-                                (er.a == A[(i + 1) % 3] && er.b == A[i]));
-                    }), vec.end());
-                if (vec.empty()) M.erase(it);
-            }
-        };
-        auto addTriEdges = [&](int tid, const Tri& tri)
-        {
-            int A[3] = { tri.a, tri.b, tri.c };
-            for (int i = 0; i < 3; ++i)
-                M[EdgeKey(A[i], A[(i + 1) % 3])].push_back({ tid, A[i], A[(i + 1) % 3] });
-        };
-
-        removeTriEdges(t1, old1);
-        removeTriEdges(t2, old2);
-        addTriEdges(t1, T[t1]);
-        addTriEdges(t2, T[t2]);
-
-        // 이웃 로컬 리빌드
-        rebuildLocalNeighborsForTri(t1, T, M, N);
-        rebuildLocalNeighborsForTri(t2, T, M, N);
-    }
-
-    // (NEW) flipDiagonal + 국소 갱신 래퍼
-    static inline bool tryFlipAndUpdate(
-        std::vector<Tri>& T, const std::vector<Vec2>& P,
-        int t1, int t2, int u, int v,
-        std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash>& M,
-        std::vector<NeighArr>& N)
-    {
-        Tri before1 = T[t1], before2 = T[t2];
-        if (!flipDiagonal(T, P, t1, t2, u, v)) return false;
-        updateMapsAfterFlip(t1, t2, before1, before2, T, M, N);
-        return true;
-    }
-
-    struct EdgeLocal { int a, b; };
-
-    static inline void pushIfFree(std::vector<EdgeLocal>& q, int a, int b,
-                                const std::unordered_set<EdgeKey, EdgeKeyHash>& forced){
-        EdgeKey k(a,b);
-        if (!forced.count(k)) q.push_back({std::min(a,b), std::max(a,b)});
-    }
-
-    static inline void localLegalizeQueue(
-        std::vector<Tri>& T, const std::vector<Vec2>& P,
-        const std::unordered_set<EdgeKey, EdgeKeyHash>& forced,
-        CDTWorkState& S, std::vector<EdgeLocal>& seeds,
-        int flip_budget = 1<<30)
-    {
-        while (!seeds.empty() && flip_budget>0){
-            EdgeLocal e = seeds.back(); seeds.pop_back();
-            if (forced.count(EdgeKey(e.a,e.b))) continue;
-
-            int t1=-1,t2=-1;
-            if (!findEdgeTris(S.M, e.a, e.b, t1, t2)) continue;
-            if (t1<0 || t2<0) continue;
-
-            int c=-1,d=-1;
-            { auto tr=T[t1]; int vv[3]={tr.a,tr.b,tr.c};
-            for (int k=0;k<3;++k) if (vv[k]!=e.a && vv[k]!=e.b){ c=vv[k]; break; } }
-            { auto tr=T[t2]; int vv[3]={tr.a,tr.b,tr.c};
-            for (int k=0;k<3;++k) if (vv[k]!=e.a && vv[k]!=e.b){ d=vv[k]; break; } }
-            if (c<0||d<0) continue;
-            if (geom::orient2d_filt(P[e.a],P[e.b],P[c])<=0) continue;
-            if (geom::orient2d_filt(P[e.b],P[e.a],P[d])<=0) continue;
-
-            bool bad = (geom::incircle_filt(P[e.a],P[e.b],P[c],P[d]) > 0.0);
-            if (!bad) continue;
-
-            if (forced.count(EdgeKey(c,d))) continue;
-
-            Tri before1=T[t1], before2=T[t2];
-            if (flipDiagonal(T,P,t1,t2,e.a,e.b)){
-                updateMapsAfterFlip(t1,t2,before1,before2,T,S.M,S.N);
-                updateMapsAfterFlip_v2t(t1, T[t1], S.vert2tri);
-                updateMapsAfterFlip_v2t(t2, T[t2], S.vert2tri);
-                --flip_budget;
-
-                pushIfFree(seeds, c, d, forced);
-                pushIfFree(seeds, e.a, c, forced);
-                pushIfFree(seeds, c, e.b, forced);
-                pushIfFree(seeds, e.b, d, forced);
-                pushIfFree(seeds, d, e.a, forced);
-            }
-        }
-    }
-    
-    inline bool insertConstraintEdge_state(
-        std::vector<Tri>& T, const std::vector<Vec2>& P,
-        int a, int b,
-        const std::unordered_set<EdgeKey, EdgeKeyHash>& forced_set,
-        int& globalFlipBudget,
-        CDTWorkState& S)
-    {
-        if (a == b) return true;
-        if (hasEdge(S.M, a, b)) return true;
-    
-        const Vec2& A = P[a]; const Vec2& B = P[b];
-        auto& C = cfg::get();
-    
-        int t = (a >= 0 && a < (int)S.vert2tri.size() ? S.vert2tri[a] : -1);
-        if (t < 0) t = locateTriangleSlow(T, P, A);
-        if (t < 0) t = 0;
-    
-        int flips = 0;
-        int guard_iters = (int)T.size() * 6 + 64;
-    
-        while (!hasEdge(S.M, a, b))
-        {
-            if (globalFlipBudget <= 0 || flips >= C.max_flips_per_segment) return false;
-            if (--guard_iters <= 0) return false;
-    
-            int eidx = -1; double tAB = 0.0;
-            if (!pickCrossingEdge(t, T, P, A, B, eidx, tAB))
-            {
-                struct Hit { int u, v, t1, t2; double t; };
-                std::vector<Hit> hits; hits.reserve(32);
-                for (const auto& kv : S.M)
-                {
-                    int u = kv.first.u, v = kv.first.v;
-                    if (u == a || v == a || u == b || v == b) continue;
-                    if (forced_set.count(kv.first)) continue;
-                    int t1=-1,t2=-1;
-                    if (!findEdgeTris(S.M, u, v, t1, t2)) continue;
-                    double tp;
-                    if (segmentStrictIntersectAB_E(A, B, P[u], P[v], tp))
-                        hits.push_back({u, v, t1, t2, tp});
-                }
-                if (hits.empty()) return false;
-                std::sort(hits.begin(), hits.end(), [](auto& x, auto& y){return x.t<y.t;});
-                bool did=false;
-                for (const auto& h: hits)
-                {
-                    if (globalFlipBudget <= 0) return false;
-                    if (forced_set.count(EdgeKey(h.u,h.v))) continue;
-                    Tri before1=T[h.t1], before2=T[h.t2];
-                    if (flipDiagonal(T, P, h.t1, h.t2, h.u, h.v))
-                    {
-                        updateMapsAfterFlip(h.t1, h.t2, before1, before2, T, S.M, S.N);
-                        updateMapsAfterFlip_v2t(h.t1, T[h.t1], S.vert2tri);
-                        updateMapsAfterFlip_v2t(h.t2, T[h.t2], S.vert2tri);
-                        ++flips; --globalFlipBudget; did=true;
-    
-                        std::vector<EdgeLocal> seeds;
-                        pushIfFree(seeds, std::min(h.u,h.v), std::max(h.u,h.v), forced_set);
-                        localLegalizeQueue(T, P, forced_set, S, seeds);
-                        break;
-                    }
-                }
-                if (!did) return false;
-                int seed = S.vert2tri[a];
-                t = (seed>=0? seed : locateTriangleSlow(T, P, A));
-                if (t < 0) t = 0;
-                continue;
-            }
-    
-            const Tri& cur = T[t];
-            int V[3] = {cur.a, cur.b, cur.c};
-            int u = V[eidx], v = V[(eidx+1)%3];
-    
-            if (forced_set.count(EdgeKey(u,v)))
-            {
-                int tn = S.N[t][eidx];
-                if (tn < 0) return false;
-                t = tn; continue;
-            }
-    
-            int t1 = t, t2 = S.N[t][eidx];
-            if (t2 < 0)
-            {
-                int tn = S.N[t][eidx];
-                if (tn < 0) return false;
-                t = tn; continue;
-            }
-    
-            Tri before1=T[t1], before2=T[t2];
-            if (flipDiagonal(T, P, t1, t2, u, v))
-            {
-                updateMapsAfterFlip(t1, t2, before1, before2, T, S.M, S.N);
-                updateMapsAfterFlip_v2t(t1, T[t1], S.vert2tri);
-                updateMapsAfterFlip_v2t(t2, T[t2], S.vert2tri);
-                ++flips; --globalFlipBudget;
-    
-                // 국소 합법화
-                std::vector<EdgeLocal> seeds;
-                pushIfFree(seeds, std::min(u,v), std::max(u,v), forced_set);
-                localLegalizeQueue(T, P, forced_set, S, seeds);
-    
-                // A가 들어있는 tri로 재시드
-                int seed = S.vert2tri[a];
-                if (seed>=0) t = seed;
-                else {
-                    t = locateTriangleSlow(T, P, A);
-                    if (t<0) t=0;
-                }
-            }
-            else
-            {
-                int tn = S.N[t][eidx];
-                if (tn < 0) return false;
-                t = tn;
-            }
-        }
-        return true;
-    }
-    
-
-    inline void legalizeCDT(
-        std::vector<Tri>& T,
-        const std::vector<Vec2>& P,
-        const std::unordered_set<EdgeKey, EdgeKeyHash>& forced_set,
-        int max_passes = 3)
-    {
-        for (int pass = 0; pass < max_passes; ++pass)
-        {
-            bool changed = false;
-    
-            // 패스마다 1회만 구축
-            std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash> M;
-            buildEdgeMap(T, M);
-            std::vector<NeighArr> N;
-            buildNeighborsFromMap(T, M, N);
-    
-            for (const auto& kv : M)
-            {
-                if (forced_set.count(kv.first)) continue;
-                int a = kv.first.u, b = kv.first.v;
-    
-                int t1 = -1, t2 = -1;
-                if (!findEdgeTris(M, a, b, t1, t2)) continue;
-    
-                int c = -1, d = -1;
-                {
-                    auto tri = T[t1];
-                    int vv[3] = { tri.a, tri.b, tri.c };
-                    for (int k = 0; k < 3; ++k) if (vv[k] != a && vv[k] != b) { c = vv[k]; break; }
-                }
-                {
-                    auto tri = T[t2];
-                    int vv[3] = { tri.a, tri.b, tri.c };
-                    for (int k = 0; k < 3; ++k) if (vv[k] != a && vv[k] != b) { d = vv[k]; break; }
-                }
-                if (c == -1 || d == -1) continue;
-                if (geom::orient2d_filt(P[a], P[b], P[c]) <= 0) continue; // CCW 가드
-                if (geom::orient2d_filt(P[b], P[a], P[d]) <= 0) continue;
-    
-                bool bad = (geom::incircle_filt(P[a], P[b], P[c], P[d]) > 0.0);
-                if (!bad) continue;
-    
-                EdgeKey newk(c, d);
-                if (forced_set.count(newk)) continue;
-    
-                if (tryFlipAndUpdate(T, P, t1, t2, a, b, M, N))
-                    changed = true;
-            }
-            if (!changed) break;
-        }
-    }
 } // namespace delaunay
 
-//============================= CDT with Recovery ============================
-struct Constraint
-{
-    int a, b;
-    int splits = 0;
-};
-
-struct CDTResult
-{
-    vector<geom::Vec2> all;
-    vector<int> label; // 0 inner,1 outer
-    vector<delaunay::Tri> tris;
-    vector<pair<int, int>> forced_edges;
-    bool all_forced_ok = false;
-};
-
-static CDTResult buildCDT_withRecovery(vector<geom::Vec2> inner, vector<geom::Vec2> outer,
-                                       bool enforce_constraints = true)
-{
-    auto &C = cfg::get();
-
-    CDTResult R;
-    R.all = inner;
-    R.all.insert(R.all.end(), outer.begin(), outer.end());
-    R.label.assign(R.all.size(), 0);
-    for (size_t i = 0; i < R.all.size(); ++i)
-        R.label[i] = (i < inner.size() ? 0 : 1);
-
-    if (!enforce_constraints)
-    {
-        R.tris = delaunay::bowyerWatson(R.all);
-        R.forced_edges.clear();
-        R.all_forced_ok = false;
-        return R;
-    }
-
-    auto rebuildDT = [&](vector<delaunay::Tri> &T)
-    { T = delaunay::bowyerWatson(R.all); };
-
-    vector<delaunay::Tri> T;
-    rebuildDT(T);
-
-    delaunay::CDTWorkState S;
-    delaunay::buildState(T, (int)R.all.size(), S);
-
-    vector<Constraint> cons;
-    int nIn = (int)inner.size(), nOut = (int)outer.size();
-    auto pushRing = [&](int base, int n)
-    { for (int i=0;i<n;i++){ int j=(i+1)%n; cons.push_back({base+i, base+j, 0}); } };
-    pushRing(0, nIn);
-    pushRing(nIn, nOut);
-
-    auto rebuildForcedSet = [&](std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash> &F)
-    {
-        F.clear();
-        F.reserve(cons.size() * 2);
-        for (auto &c : cons)
-            F.insert(delaunay::EdgeKey(c.a, c.b));
-    };
-
-    int globalFlipBudget = C.max_global_flips;
-    bool ok = false;
-
-    for (int rebuilds = 0; rebuilds <= C.max_cdt_rebuilds; ++rebuilds)
-    {
-        std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash> forced;
-        rebuildForcedSet(forced);
-
-        ok = true;
-        for (size_t k = 0; k < cons.size(); ++k)
-        {
-            auto &seg = cons[k];
-            if (globalFlipBudget <= 0)
-            {
-                ok = false;
-                break;
-            }
-
-            if (delaunay::insertConstraintEdge_state(T, R.all, seg.a, seg.b, forced, globalFlipBudget, S))
-                continue;
-
-            if (seg.splits >= C.max_segment_splits)
-            {
-                ok = false;
-                break;
-            }
-            geom::Vec2 A = R.all[seg.a], B = R.all[seg.b];
-            geom::Vec2 M = (A + B) * 0.5;
-            int newIdx = (int)R.all.size();
-            R.all.push_back(M);
-            R.label.push_back(R.label[seg.a]);
-
-            Constraint left{seg.a, newIdx, seg.splits + 1};
-            Constraint right{newIdx, seg.b, seg.splits + 1};
-            cons.erase(cons.begin() + k);
-            cons.insert(cons.begin() + k, right);
-            cons.insert(cons.begin() + k, left);
-
-            rebuildDT(T);
-            delaunay::buildState(T, (int)R.all.size(), S); // ★ 상태 재구축
-            rebuildForcedSet(forced);
-            ok = false;
-            break;
-        }
-        if (ok)
-        {
-            delaunay::legalizeCDT(T, R.all, /*forced*/ std::unordered_set<delaunay::EdgeKey, delaunay::EdgeKeyHash>(), 1);
-            break;
-        }
-        if (C.verbose)
-            cerr << "[CDT] rebuild " << (rebuilds + 1) << " due to split; total pts=" << R.all.size() << "\n";
-        if (rebuilds == C.max_cdt_rebuilds)
-            break;
-    }
-
-    R.tris = std::move(T);
-    R.all_forced_ok = ok;
-
-    R.forced_edges.clear();
-    R.forced_edges.reserve(cons.size());
-    for (const auto &c : cons)
-        R.forced_edges.push_back({c.a, c.b});
-
-    return R;
-}
-
-//=========================== Clip & Quality Filter =========================
+//=========================== Clip & Simple Edges ===========================
 namespace clip
 {
     using geom::Vec2;
@@ -1289,71 +348,6 @@ namespace clip
         for (int i = 0; i + 1 < n; ++i)
             E.push_back({R[i], R[i + 1]});
         return E;
-    }
-
-    inline bool triQualityOK(const Vec2 &A, const Vec2 &B, const Vec2 &C, double medEdge)
-    {
-        auto &Cfg = cfg::get();
-        if (!Cfg.enable_quality_filter)
-            return true;
-
-        double area2 = geom::triArea2(A, B, C);
-        if (area2 * 0.5 < Cfg.min_triangle_area)
-            return false;
-
-        double angA = geom::angleAt(B, A, C);
-        double angB = geom::angleAt(A, B, C);
-        double angC = geom::angleAt(A, C, B);
-        double minAngDeg = std::min({angA, angB, angC}) * 180.0 / M_PI;
-        if (minAngDeg < Cfg.min_triangle_angle_deg)
-            return false;
-
-        double e1 = geom::norm(B - A), e2 = geom::norm(C - B), e3 = geom::norm(A - C);
-        double edges[3] = {e1, e2, e3};
-        std::sort(edges, edges + 3);
-        double maxEdge = edges[2];
-        if (medEdge > 1e-12 && maxEdge > Cfg.max_edge_length_scale * medEdge)
-            return false;
-
-        return true;
-    }
-
-    inline bool triangleKeep(const Vec2 &A, const Vec2 &B, const Vec2 &C,
-                             const vector<Vec2> &inner, const vector<Vec2> &outer,
-                             const vector<pair<Vec2, Vec2>> &innerE,
-                             const vector<pair<Vec2, Vec2>> &outerE,
-                             double medEdgeForQuality)
-    {
-        Vec2 cent = (A + B + C) * (1.0 / 3.0);
-        if (!geom::pointInPoly(outer, cent))
-            return false;
-        if (geom::pointInPoly(inner, cent))
-            return false;
-
-        auto crosses = [&](const Vec2 &u, const Vec2 &v) -> bool
-        {
-            for (const auto &e : innerE)
-            {
-                if (geom::almostEq(u, e.first) || geom::almostEq(u, e.second) || geom::almostEq(v, e.first) || geom::almostEq(v, e.second))
-                    continue;
-                if (geom::segIntersectProper(u, v, e.first, e.second))
-                    return true;
-            }
-            for (const auto &e : outerE)
-            {
-                if (geom::almostEq(u, e.first) || geom::almostEq(u, e.second) || geom::almostEq(v, e.first) || geom::almostEq(v, e.second))
-                    continue;
-                if (geom::segIntersectProper(u, v, e.first, e.second))
-                    return true;
-            }
-            return false;
-        };
-        if (crosses(A, B) || crosses(B, C) || crosses(C, A))
-            return false;
-        if (!triQualityOK(A, B, C, medEdgeForQuality))
-            return false;
-
-        return true;
     }
 } // namespace clip
 
@@ -2153,11 +1147,21 @@ namespace raceline_min_curv
         std::vector<double> alpha_last;
     };
 
-    // --- Fallback helpers (선언부 아래 구현부 참고) ---
-    static double rayToRingDistance(const Vec2 &P, const Vec2 &dir,
-                                    const std::vector<std::pair<Vec2, Vec2>> &ringEdges); // forward from global
     static double minDistanceToSegments(const Vec2 &P,
-                                        const std::vector<std::pair<Vec2, Vec2>> &E);
+                                        const std::vector<std::pair<Vec2, Vec2>> &E)
+    {
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto &e : E)
+        {
+            Vec2 a = e.first, b = e.second;
+            Vec2 ab{b.x - a.x, b.y - a.y}, ap{P.x - a.x, P.y - a.y};
+            double denom = std::max(1e-30, ab.x * ab.x + ab.y * ab.y);
+            double t = std::clamp((ab.x * ap.x + ab.y * ap.y) / denom, 0.0, 1.0);
+            Vec2 Q{a.x + ab.x * t, a.y + ab.y * t};
+            best = std::min(best, std::hypot(P.x - Q.x, P.y - Q.y));
+        }
+        return best;
+    }
 
     static Result compute_min_curvature_raceline(const std::vector<Vec2> &center,
                                                  const std::vector<std::pair<Vec2, Vec2>> &innerE,
@@ -2212,7 +1216,7 @@ namespace raceline_min_curv
                 lo[i] = 0.0;
         }
 
-        if (C.verbose)
+        if (true)
         {
             double hi_avg = 0, lo_avg = 0, hi_max = 0, lo_max = 0;
             for (int i = 0; i < N; ++i)
@@ -2237,7 +1241,7 @@ namespace raceline_min_curv
             double step = C.step_init;
             auto cg = eval_cost_grad_frozen(G.A1, G.A2, G.N0, G.W, h, C.lambda_smooth, alpha, closed);
             double J_prev = cg.J;
-            if (C.verbose)
+            if (true)
                 cerr << "[GN " << outer << "]  J0=" << J_prev << "  step=" << step << "  lambda=" << C.lambda_smooth << "\n";
 
             for (int it = 0; it < C.max_inner_iters; ++it)
@@ -2305,7 +1309,7 @@ namespace raceline_min_curv
         std::vector<double> heading, kappa;
         heading_curv_from_points_generic(Pbase, h, closed, heading, kappa);
 
-        if (cfg::get().verbose)
+        if (true)
         {
             double ksum = 0;
             for (double v : kappa)
@@ -2314,22 +1318,6 @@ namespace raceline_min_curv
         }
 
         return {std::move(Pbase), std::move(heading), std::move(kappa), std::move(alpha_accum), std::move(alpha_last_stage)};
-    }
-
-    // 최근접 선분 거리 (fallback)
-    static double minDistanceToSegments(const Vec2 &P, const std::vector<std::pair<Vec2, Vec2>> &E)
-    {
-        double best = std::numeric_limits<double>::infinity();
-        for (const auto &e : E)
-        {
-            Vec2 a = e.first, b = e.second;
-            Vec2 ab{b.x - a.x, b.y - a.y}, ap{P.x - a.x, P.y - a.y};
-            double denom = std::max(1e-30, ab.x * ab.x + ab.y * ab.y);
-            double t = std::clamp((ab.x * ap.x + ab.y * ap.y) / denom, 0.0, 1.0);
-            Vec2 Q{a.x + ab.x * t, a.y + ab.y * t};
-            best = std::min(best, std::hypot(P.x - Q.x, P.y - Q.y));
-        }
-        return best;
     }
 
 } // namespace raceline_min_curv
@@ -2465,7 +1453,7 @@ static double rayToRingDistance(const geom::Vec2 &P, const geom::Vec2 &dir,
     return best;
 }
 
-// 최근접 선분 거리 (raceline 네임스페이스에도 동일 구현이 있음)
+// 최근접 선분 거리 (fallback)
 static double minDistanceToSegments_global(const geom::Vec2 &P, const std::vector<std::pair<geom::Vec2, geom::Vec2>> &E)
 {
     double best = std::numeric_limits<double>::infinity();
@@ -2510,92 +1498,6 @@ static void distancesToRings(const geom::Vec2 &P, const geom::Vec2 &n,
         d_outer = 0.0;
 }
 
-// 기존 enforce_open_orientation_precise를 아래 구현으로 교체
-static void enforce_open_orientation_precise(
-    std::vector<geom::Vec2> &chain,
-    const geom::Vec2 &curr_pos,
-    const geom::Vec2 &curr_dir_in)
-{
-    using geom::Vec2;
-    auto norm = [](const Vec2 &v)
-    { return std::sqrt(v.x * v.x + v.y * v.y); };
-    auto dot = [](const Vec2 &a, const Vec2 &b)
-    { return a.x * b.x + a.y * b.y; };
-
-    if (chain.size() < 2)
-        return;
-
-    // curr_dir은 반드시 단위벡터로
-    Vec2 curr_dir = curr_dir_in;
-    double nd = norm(curr_dir);
-    if (nd > 1e-12)
-    {
-        curr_dir.x /= nd;
-        curr_dir.y /= nd;
-    }
-    else
-    {
-        curr_dir = {1, 0};
-    }
-
-    // 1) 가장 가까운 "세그먼트" 찾기
-    int best_i = 0;
-    double best_dist2 = std::numeric_limits<double>::infinity();
-    double best_t = 0.0;
-
-    for (int i = 0; i < (int)chain.size() - 1; ++i)
-    {
-        Vec2 a = chain[i], b = chain[i + 1];
-        Vec2 ab{b.x - a.x, b.y - a.y};
-        Vec2 ap{curr_pos.x - a.x, curr_pos.y - a.y};
-        double denom = std::max(1e-30, ab.x * ab.x + ab.y * ab.y);
-        double t = std::clamp((ab.x * ap.x + ab.y * ap.y) / denom, 0.0, 1.0);
-        Vec2 q{a.x + ab.x * t, a.y + ab.y * t};
-        double d2 = (curr_pos.x - q.x) * (curr_pos.x - q.x) + (curr_pos.y - q.y) * (curr_pos.y - q.y);
-        if (d2 < best_dist2)
-        {
-            best_dist2 = d2;
-            best_i = i;
-            best_t = t;
-        }
-    }
-
-    // 2) 해당 세그먼트의 진행방향과 헤딩 비교
-    Vec2 seg{chain[best_i + 1].x - chain[best_i].x,
-             chain[best_i + 1].y - chain[best_i].y};
-    double nseg = norm(seg);
-    if (nseg < 1e-12)
-        return; // 퇴화 세그먼트
-
-    seg.x /= nseg;
-    seg.y /= nseg;
-
-    // 3) 내적 < 0 → 경로를 뒤집어 진행방향과 정렬
-    if (dot(seg, curr_dir) < 0.0)
-    {
-        std::reverse(chain.begin(), chain.end());
-    }
-}
-
-// (B) 폐루프: "초기(시작) 위치에 가장 가까운 점"을 첫 인덱스로 되돌려 시작점 회전
-static void rotate_closed_chain_to_anchor(std::vector<geom::Vec2> &ring, const geom::Vec2 &anchor)
-{
-    if (ring.size() < 2)
-        return;
-    size_t kmin = 0;
-    double best = 1e300;
-    for (size_t i = 0; i < ring.size(); ++i)
-    {
-        double d = std::hypot(ring[i].x - anchor.x, ring[i].y - anchor.y);
-        if (d < best)
-        {
-            best = d;
-            kmin = i;
-        }
-    }
-    std::rotate(ring.begin(), ring.begin() + kmin, ring.end());
-}
-
 static inline geom::Vec2 dir_from_heading_rad(double rad)
 {
     return {std::cos(rad), std::sin(rad)};
@@ -2609,7 +1511,6 @@ namespace timing
     using Clock = std::chrono::steady_clock;
     using Ms = std::chrono::duration<double, std::milli>;
 
-    // 스코프가 끝날 때 자동으로 시간 출력
     struct Scoped
     {
         const char *name;
@@ -2622,7 +1523,6 @@ namespace timing
             std::cerr << "[TIME] " << name << " = " << std::setprecision(3) << ms << " ms\n";
         }
     };
-    // 누적 측정값을 외부 변수에 합산 + 출력
     struct ScopedAcc
     {
         const char *name;
@@ -2648,7 +1548,7 @@ int main(int argc, char **argv)
 
     // 전체 실행 시간 시작
     auto _t_all = timing::Clock::now();
-    double T_load = 0, T_order = 0, T_cdt = 0, T_clip = 0, T_mids = 0, T_orderMST = 0,
+    double T_load = 0, T_order = 0, T_dt = 0, T_mids = 0, T_orderMST = 0,
            T_spline = 0, T_saveCenter = 0, T_geom = 0, T_race = 0, T_saveRace = 0;
 
     if (argc < 4)
@@ -2676,7 +1576,7 @@ int main(int argc, char **argv)
 
     const bool closed_mode = C.is_closed_track;
 
-    // [1-DBG] 현재/초기 앵커 상태 출력
+    // [DBG] 현재/초기 앵커 상태 출력
     {
         const geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
         const geom::Vec2 curr_pos{C.current_pos_x, C.current_pos_y};
@@ -2689,36 +1589,32 @@ int main(int argc, char **argv)
                   << " curr_dir=(" << curr_dir.x << "," << curr_dir.y << ")\n";
     }
 
-    // ★ 초기 정렬 제거 (auto_order_rings 블록 삭제)
-
-    // [2] 제약 없이 Bowyer–Watson Delaunay만 (폐/비폐 동일)
-    CDTResult cdt;
+    // [2] Delaunay(Bowyer–Watson) — DT only
+    std::vector<geom::Vec2> all_pts;
+    std::vector<int> labels; // 0=inner, 1=outer
+    std::vector<delaunay::Tri> tris;
     {
-        timing::ScopedAcc _t("2) Delaunay 삼각분할(비제약)", &T_cdt);
-        cdt = buildCDT_withRecovery(inner, outer, /*enforce_constraints=*/false);
+        timing::ScopedAcc _t("2) Delaunay 삼각분할(BW)", &T_dt);
+        all_pts = inner;
+        all_pts.insert(all_pts.end(), outer.begin(), outer.end());
+        labels.assign(all_pts.size(), 0);
+        for (size_t i = 0; i < all_pts.size(); ++i)
+            labels[i] = (i < inner.size() ? 0 : 1);
+
+        tris = delaunay::bowyerWatson(all_pts);
     }
-    if (C.verbose)
-        cerr << "[DT] unconstrained triangulation, total points=" << cdt.all.size()
-             << ", faces=" << cdt.tris.size() << "\n";
-    // (보존) 모든 포인트+라벨 저장
-    io::saveCSV_pointsLabeled(base + "_all_points.csv", cdt.all, cdt.label);
-    // (요청 1) 삼각분할 저장
-    io::saveCSV_trisIdx(base + "_tri_raw_idx.csv", cdt.tris);
 
-    // ※ 링 추출 전까지 폐/비폐 동일 처리를 위해 클리핑/품질필터 단계 생략
-    //   faces_kept = cdt.tris 로 통일
-    std::vector<delaunay::Tri> faces_kept = cdt.tris;
-
-    // (요청 2) 추출된 모든 엣지 저장
+    // 포인트+라벨 / 삼각형 / 모든 엣지 저장
+    io::saveCSV_pointsLabeled(base + "_all_points.csv", all_pts, labels);
+    io::saveCSV_trisIdx(base + "_tri_raw_idx.csv", tris);
     {
         std::unordered_map<delaunay::EdgeKey, std::vector<delaunay::EdgeRef>, delaunay::EdgeKeyHash> M;
-        delaunay::buildEdgeMap(faces_kept, M);
+        delaunay::buildEdgeMap(tris, M);
         std::vector<std::pair<int,int>> edges_all;
         edges_all.reserve(M.size());
         for (const auto& kv : M)
             edges_all.push_back({kv.first.u, kv.first.v});
         io::saveCSV_edgesIdx(base + "_edges_all_idx.csv", edges_all);
-        if (C.verbose) cerr << "[edges] all unique edges = " << edges_all.size() << "\n";
     }
 
     // [3] 라벨 다른 경계엣지 추출 + 길이 필터
@@ -2727,19 +1623,18 @@ int main(int argc, char **argv)
     std::vector<centerline::BoundaryEdgeInfo> binfo; // 재사용/저장용
     {
         timing::ScopedAcc _t("3) 경계엣지 중점+길이필터", &T_mids);
-        binfo = centerline::labelBoundaryEdges_with_len(cdt.all, faces_kept, cdt.label);
+        binfo = centerline::labelBoundaryEdges_with_len(all_pts, tris, labels);
         if (binfo.empty())
         {
             cerr << "[ERR] no label-different boundary edges\n";
             return 4;
         }
 
-        // (요청 3) 라벨 다른 엣지 저장
+        // 라벨 다른 엣지 저장
         std::vector<std::pair<int,int>> edges_mixed;
         edges_mixed.reserve(binfo.size());
         for (auto &e : binfo) edges_mixed.push_back({e.u, e.v});
         io::saveCSV_edgesIdx(base + "_edges_labeldiff_idx.csv", edges_mixed);
-        if (C.verbose) cerr << "[edges] label-different edges = " << edges_mixed.size() << "\n";
 
         // 길이 중앙값 기반 컷오프
         std::vector<double> lens; lens.reserve(binfo.size());
@@ -2775,7 +1670,7 @@ int main(int argc, char **argv)
             return 4;
         }
 
-        // (요청 4) 길이 필터 통과한 엣지 저장
+        // 길이 필터 통과한 엣지 저장
         std::vector<std::pair<int,int>> edges_kept;
         edges_kept.reserve(keep_edge_idx.size());
         for (int idx : keep_edge_idx){
@@ -2783,8 +1678,6 @@ int main(int argc, char **argv)
             edges_kept.push_back({e.u, e.v});
         }
         io::saveCSV_edgesIdx(base + "_edges_labeldiff_kept_idx.csv", edges_kept);
-        if (C.verbose) cerr << "[edges] kept (len-filtered label-diff) = " << edges_kept.size()
-                            << " / " << binfo.size() << "\n";
     }
 
     // 샘플 수 동적 조정
@@ -2795,12 +1688,10 @@ int main(int argc, char **argv)
         dyn = std::max(dyn, C.samples_min);
         if (C.samples_max > 0) dyn = std::min(dyn, C.samples_max);
         dyn = std::max(dyn, 4);
-        if (C.verbose)
-            cerr << "[samples] dynamic=" << dyn << "  (n=" << C.sample_factor_n << ", mids_raw=" << total_mids << ")\n";
         C.samples = dyn;
     }
 
-    // [4] 중점 순서화(MST) + 방향/시작점 정합 (교체)
+    // [4] 중점 순서화(MST) + 방향/시작점 정합
     std::vector<geom::Vec2> ordered;
     std::vector<int> mids_order_idx;
     {
@@ -2825,14 +1716,11 @@ int main(int argc, char **argv)
         auto vnorm = [](const geom::Vec2& v)->geom::Vec2{
             return geom::normalize(v, 1e-12);
         };
-        // OPEN: 단순 끝점 처리 (wrap 없음)
         auto local_dir_open = [&](const std::vector<geom::Vec2>& S, size_t i)->geom::Vec2{
             if (S.size()<2) return {1,0};
             if (i+1 < S.size()) return vnorm(geom::Vec2{S[i+1].x - S[i].x, S[i+1].y - S[i].y});
-            // i == 마지막 → 직전에서 현재로
             return vnorm(geom::Vec2{S[i].x - S[i-1].x, S[i].y - S[i-1].y});
         };
-        // CLOSED: 다음 점은 wrap
         auto local_dir_closed = [&](const std::vector<geom::Vec2>& S, size_t i)->geom::Vec2{
             if (S.size()<2) return {1,0};
             size_t j = (i+1) % S.size();
@@ -2841,7 +1729,7 @@ int main(int argc, char **argv)
 
         if (!closed_mode) {
             // ===== OPEN =====
-            // 1) 방향: "현재 차량 위치"에 가장 가까운 중점 i*와 그 다음점 방향벡터 vs "현재 차량 헤딩"
+            // 1) 방향: 현재 차량 위치에 가장 가까운 중점 i*의 국소 진행방향 vs 현재 헤딩
             geom::Vec2 curr_pos{C.current_pos_x, C.current_pos_y};
             geom::Vec2 curr_dir = vnorm(dir_from_heading_rad(C.current_heading_rad));
 
@@ -2851,14 +1739,14 @@ int main(int argc, char **argv)
             if (dotv < 0.0)
                 reverse_both(ordered, mids_order_idx);
 
-            // 2) 시작점: "차량 초기 위치(start_anchor)"에 가장 가까운 중점이 index 0이 되도록 회전
+            // 2) 시작점: 초기 위치(start_anchor)에 가장 가까운 중점이 index 0이 되도록 회전
             geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
             size_t k = nearest_idx(ordered, start_anchor);
             std::rotate(ordered.begin(), ordered.begin()+k, ordered.end());
             std::rotate(mids_order_idx.begin(), mids_order_idx.begin()+k, mids_order_idx.end());
         } else {
             // ===== CLOSED =====
-            // 1) 방향: "초기 위치(start_anchor)에 가장 가까운 중점 i*의 국소 진행방향" vs "초기 차량 헤딩"
+            // 1) 방향: 초기 위치에 가장 가까운 중점 i*의 wrap-다음점 방향 vs 초기 헤딩
             geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
             geom::Vec2 init_dir = vnorm(dir_from_heading_rad(C.start_heading_rad));
 
@@ -2867,9 +1755,6 @@ int main(int argc, char **argv)
             double dotv = vloc.x*init_dir.x + vloc.y*init_dir.y;
             if (dotv < 0.0)
                 reverse_both(ordered, mids_order_idx);
-
-            // (옵션) 무조건 CCW를 원하면 아래 한 줄을 켜면 됨:
-            // if (ordered.size() >= 3 && orient::signedArea(ordered) < 0.0) reverse_both(ordered, mids_order_idx);
 
             // 2) 시작점: start_anchor에 가장 가까운 중점이 index 0이 되도록 회전
             i_near_anchor = nearest_idx(ordered, start_anchor); // 뒤집혔을 수 있으니 재계산
@@ -2881,17 +1766,17 @@ int main(int argc, char **argv)
         io::saveCSV_pointsXY(base + "_mids_ordered.csv", ordered);
     }
 
-    // [5] 중점 순서를 이용해 링(콘) 재정렬
+    // [5] 중점 순서를 이용해 링(콘) 재정렬 + 방향(중점 정렬 방향과 일치)
     std::vector<geom::Vec2> inner_from_mids, outer_from_mids;
     {
-        std::vector<char> seen_inner(cdt.all.size(), 0);
-        std::vector<char> seen_outer(cdt.all.size(), 0);
+        std::vector<char> seen_inner(all_pts.size(), 0);
+        std::vector<char> seen_outer(all_pts.size(), 0);
 
         auto get_inner_outer = [&](int u, int v, int &iv, int &ov){
             // label: 0=inner, 1=outer
-            if (cdt.label[u] == 0 && cdt.label[v] == 1){ iv = u; ov = v; }
-            else if (cdt.label[u] == 1 && cdt.label[v] == 0){ iv = v; ov = u; }
-            else { iv = ov = -1; } // 방어
+            if (labels[u] == 0 && labels[v] == 1){ iv = u; ov = v; }
+            else if (labels[u] == 1 && labels[v] == 0){ iv = v; ov = u; }
+            else { iv = ov = -1; }
         };
 
         for (int k=0; k<(int)mids_order_idx.size(); ++k){
@@ -2901,8 +1786,8 @@ int main(int argc, char **argv)
 
             int iv=-1, ov=-1;
             get_inner_outer(u, v, iv, ov);
-            if (iv>=0 && !seen_inner[iv]){ inner_from_mids.push_back(cdt.all[iv]); seen_inner[iv]=1; }
-            if (ov>=0 && !seen_outer[ov]){ outer_from_mids.push_back(cdt.all[ov]); seen_outer[ov]=1; }
+            if (iv>=0 && !seen_inner[iv]){ inner_from_mids.push_back(all_pts[iv]); seen_inner[iv]=1; }
+            if (ov>=0 && !seen_outer[ov]){ outer_from_mids.push_back(all_pts[ov]); seen_outer[ov]=1; }
         }
 
         // ====== 방향 정리 (중점 방향에 맞춤) ======
@@ -2923,23 +1808,13 @@ int main(int argc, char **argv)
             if (d < 0.0) std::reverse(seq.begin(), seq.end());
         };
 
-        // ★ inner/outer 모두 중점 방향에 정렬
+        // inner/outer 모두 중점 방향에 정렬
         align_to_mids_dir(inner_from_mids);
         align_to_mids_dir(outer_from_mids);
 
         // 저장(디버깅/재사용)
         io::saveCSV_pointsXY(base + "_inner_from_mids.csv", inner_from_mids);
         io::saveCSV_pointsXY(base + "_outer_from_mids.csv", outer_from_mids);
-
-        if (C.verbose){
-            int want_in=0, want_out=0;
-            for(int i=0;i<(int)cdt.label.size();++i){
-                want_in  += (cdt.label[i]==0);
-                want_out += (cdt.label[i]==1);
-            }
-            std::cerr << "[cones-from-mids] inner used " << inner_from_mids.size() << "/" << want_in
-                    << ", outer used " << outer_from_mids.size() << "/" << want_out << "\n";
-        }
     }
 
     // [6] 스플라인 + 균일 재샘플 (센터라인)
@@ -2969,7 +1844,7 @@ int main(int argc, char **argv)
             fo << p.x << "," << p.y << "\n";
     }
 
-    // [8] 기하량 + 폭(width) 계산 및 저장  (★ 재구성 링의 엣지를 사용 ★)
+    // [8] 기하량 + 폭(width) 계산 및 저장  (재구성 링의 엣지를 사용)
     {
         timing::ScopedAcc _t("7) geom+width 계산/저장", &T_geom);
 
@@ -3120,7 +1995,7 @@ int main(int argc, char **argv)
         std::cerr.setf(std::ios::fixed);
         std::cerr << "[TIME][SUMMARY] total=" << std::setprecision(3) << total_ms << " ms  |  "
                   << "load=" << T_load
-                  << ", dt=" << T_cdt
+                  << ", dt=" << T_dt
                   << ", mids=" << T_mids << ", mst=" << T_orderMST
                   << ", spline=" << T_spline << ", saveC=" << T_saveCenter
                   << ", geom=" << T_geom << ", race=" << T_race
