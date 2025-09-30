@@ -56,10 +56,11 @@ namespace cfg
     struct Config
     {
         // --- Anchors for orientation/rotation ---
-        double current_pos_x = 8.566221832, current_pos_y = -0.244286307; // 차량 현재 위치(오픈 트랙용)
+        double current_pos_x = 4.994457593, current_pos_y = -0.108866966; // 차량 현재 위치(오픈 트랙용)
         // 헤딩 라디안: +x가 0rad, CCW가 + 방향 (표준 수학 좌표계)
-        double current_heading_rad = -0.029551796;
+        double current_heading_rad = 0.046698693;
         double start_anchor_x = 0.0, start_anchor_y = 0.0; // 초기(시작) 위치(폐루프 시작 회전용)
+        double start_heading_rad = 0.0;               // 초기(시작) 헤딩(폐루프 시작 회전용)
 
         // 알고리즘 모드(트랙 폐루프 여부)
         bool is_closed_track = true;
@@ -1700,6 +1701,69 @@ namespace centerline
         L_out = L;
         return out;
     }
+
+    inline std::vector<int> orderIndicesByMST(const std::vector<geom::Vec2>& pts)
+    {
+        auto &C = cfg::get();
+        int n = (int)pts.size();
+        if (n <= 2) { std::vector<int> id(n); std::iota(id.begin(), id.end(), 0); return id; }
+
+        int K = std::min(C.knn_k, n - 1);
+        std::vector<std::vector<std::pair<int,double>>> adj(n);
+        for (int i=0;i<n;i++){
+            std::vector<std::pair<double,int>> cand; cand.reserve(n-1);
+            for (int j=0;j<n;j++) if (i!=j){
+                double d2=(pts[i].x-pts[j].x)*(pts[i].x-pts[j].x)+(pts[i].y-pts[j].y)*(pts[i].y-pts[j].y);
+                cand.push_back({d2,j});
+            }
+            if ((int)cand.size()>K){
+                std::nth_element(cand.begin(), cand.begin()+K, cand.end(),
+                                [](auto&A,auto&B){return A.first<B.first;});
+                cand.resize(K);
+            }
+            for (auto &c : cand){
+                double w = std::sqrt(std::max(0.0, c.first));
+                adj[i].push_back({c.second,w});
+                adj[c.second].push_back({i,w});
+            }
+        }
+
+        std::vector<double> key(n,1e300); std::vector<int> par(n,-1); std::vector<char> in(n,0);
+        key[0]=0;
+        for(int it=0;it<n;++it){
+            int u=-1; double best=1e301;
+            for(int i=0;i<n;i++) if(!in[i] && key[i]<best){best=key[i]; u=i;}
+            if(u==-1) break; in[u]=1;
+            for(auto [v,w]:adj[u]) if(!in[v] && w<key[v]){key[v]=w; par[v]=u;}
+        }
+
+        std::vector<std::vector<int>> tree(n);
+        for (int v=0; v<n; v++) if (par[v]>=0){ tree[v].push_back(par[v]); tree[par[v]].push_back(v); }
+
+        auto bfs = [&](int s){
+            std::vector<double> d(n,1e300); std::vector<int> p(n,-1); std::queue<int> q;
+            q.push(s); d[s]=0;
+            while(!q.empty()){
+                int u=q.front(); q.pop();
+                for(int v:tree[u]) if(d[v]>1e299){
+                    double w=std::hypot(pts[u].x-pts[v].x, pts[u].y-pts[v].y);
+                    d[v]=d[u]+w; p[v]=u; q.push(v);
+                }
+            }
+            int far=s; for(int i=0;i<n;i++) if(d[i]>d[far]) far=i;
+            return std::tuple<int,std::vector<int>,std::vector<double>>(far,p,d);
+        };
+        auto [s1,p1,d1]=bfs(0);
+        auto [s2,p2,d2]=bfs(s1);
+
+        std::vector<int> path;
+        for(int v=s2; v!=-1; v=p2[v]) path.push_back(v);
+        std::vector<char> used(n,0);
+        std::vector<int> out; out.reserve(n);
+        for(int id: path){ out.push_back(id); used[id]=1; }
+        for(int i=0;i<n;i++) if(!used[i]) out.push_back(i);
+        return out;
+    }
 } // namespace centerline
 
 // ---- forward declarations (Ray–Segment utils) ----
@@ -2612,7 +2676,7 @@ int main(int argc, char **argv)
 
     const bool closed_mode = C.is_closed_track;
 
-    // [1-DBG] 현재/초기 앵커 상태 출력 (원하시면 유지)
+    // [1-DBG] 현재/초기 앵커 상태 출력
     {
         const geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
         const geom::Vec2 curr_pos{C.current_pos_x, C.current_pos_y};
@@ -2625,160 +2689,102 @@ int main(int argc, char **argv)
                   << " curr_dir=(" << curr_dir.x << "," << curr_dir.y << ")\n";
     }
 
-    // 자동 정렬 + 방향 강제
-    if (cfg::get().auto_order_rings)
-    {
-        timing::ScopedAcc _t("2) 링 자동 정렬/방향", &T_order);
-        if (closed_mode)
-        {
-            inner = ordering::order_closed_by_angle_then_2opt(inner, cfg::get().two_opt_iters);
-            outer = ordering::order_closed_by_angle_then_2opt(outer, cfg::get().two_opt_iters);
-            orient::ensure_ccw(outer);
-            orient::ensure_cw(inner);
-        }
-        else
-        {
-            inner = ordering::order_open_by_nn_then_2opt(inner, cfg::get().two_opt_iters);
-            outer = ordering::order_open_by_nn_then_2opt(outer, cfg::get().two_opt_iters);
-            double Aopen = orient::signedAreaCorridorOpen(inner, outer);
-            if (Aopen < 0.0)
-            {
-                std::reverse(inner.begin(), inner.end());
-                std::reverse(outer.begin(), outer.end());
-            }
-        }
-        io::saveCSV_pointsXY(io::dropExt(outPath) + "_inner_ordered.csv", inner);
-        io::saveCSV_pointsXY(io::dropExt(outPath) + "_outer_ordered.csv", outer);
-    }
+    // ★ 초기 정렬 제거 (auto_order_rings 블록 삭제)
 
-    // [2] CDT(+슈타이너 복구) — open이면 제약생략
+    // [2] 제약 없이 Bowyer–Watson Delaunay만 (폐/비폐 동일)
     CDTResult cdt;
     {
-        timing::ScopedAcc _t("3) CDT 구축(+복구)", &T_cdt);
-        cdt = buildCDT_withRecovery(inner, outer, /*enforce_constraints=*/closed_mode);
+        timing::ScopedAcc _t("2) Delaunay 삼각분할(비제약)", &T_cdt);
+        cdt = buildCDT_withRecovery(inner, outer, /*enforce_constraints=*/false);
     }
     if (C.verbose)
-    {
-        if (closed_mode)
-            cerr << "[CDT] forced insert " << (cdt.all_forced_ok ? "OK" : "RECOVERED with Steiner")
-                 << ", total points=" << cdt.all.size() << ", faces=" << cdt.tris.size() << "\n";
-        else
-            cerr << "[CDT] open-mode triangulation (no constraints), total points=" << cdt.all.size() << ", faces=" << cdt.tris.size() << "\n";
-    }
+        cerr << "[DT] unconstrained triangulation, total points=" << cdt.all.size()
+             << ", faces=" << cdt.tris.size() << "\n";
+    // (보존) 모든 포인트+라벨 저장
     io::saveCSV_pointsLabeled(base + "_all_points.csv", cdt.all, cdt.label);
-    if (closed_mode && !cdt.forced_edges.empty())
-        io::saveCSV_edgesIdx(base + "_forced_edges_idx.csv", cdt.forced_edges);
+    // (요청 1) 삼각분할 저장
     io::saveCSV_trisIdx(base + "_tri_raw_idx.csv", cdt.tris);
 
-    // [3] (closed에서만) 품질 필터 기준(엣지 길이 중앙값) + 클리핑
-    std::vector<delaunay::Tri> faces_kept, faces_drop;
-    double medEdge = 0.0;
-    {
-        timing::ScopedAcc _t("4) 트랙 클리핑+품질 필터", &T_clip);
-        if (closed_mode)
-        {
-            std::vector<double> edgeLens;
-            edgeLens.reserve(cdt.tris.size() * 3);
-            for (const auto &t : cdt.tris)
-            {
-                const auto &A = cdt.all[t.a], &B = cdt.all[t.b], &Cc = cdt.all[t.c];
-                edgeLens.push_back(geom::norm(B - A));
-                edgeLens.push_back(geom::norm(Cc - B));
-                edgeLens.push_back(geom::norm(A - Cc));
-            }
-            if (!edgeLens.empty())
-            {
-                size_t m = edgeLens.size() / 2;
-                std::nth_element(edgeLens.begin(), edgeLens.begin() + m, edgeLens.end());
-                medEdge = edgeLens[m];
-            }
+    // ※ 링 추출 전까지 폐/비폐 동일 처리를 위해 클리핑/품질필터 단계 생략
+    //   faces_kept = cdt.tris 로 통일
+    std::vector<delaunay::Tri> faces_kept = cdt.tris;
 
-            auto innerEdgesClosed = clip::ringEdges(inner);
-            auto outerEdgesClosed = clip::ringEdges(outer);
-
-            for (const auto &t : cdt.tris)
-            {
-                const auto &A = cdt.all[t.a], &B = cdt.all[t.b], &C3 = cdt.all[t.c];
-                if (clip::triangleKeep(A, B, C3, inner, outer, innerEdgesClosed, outerEdgesClosed, medEdge))
-                    faces_kept.push_back(t);
-                else
-                    faces_drop.push_back(t);
-            }
-            if (faces_kept.empty())
-            {
-                if (!C.allow_fallback_clip)
-                {
-                    cerr << "[ERR] no faces after clipping\n";
-                    return 3;
-                }
-                faces_kept = cdt.tris;
-            }
-        }
-        else
-        {
-            faces_kept = cdt.tris;
-            faces_drop.clear();
-        }
-    }
-    io::saveCSV_trisIdx(base + "_faces_kept_idx.csv", faces_kept);
-    io::saveCSV_trisIdx(base + "_faces_drop_idx.csv", faces_drop);
-
-    // 링 에지(폴리곤/폴리라인) 준비
-    vector<pair<geom::Vec2, geom::Vec2>> innerEdgesClosed, outerEdgesClosed;
-    vector<pair<geom::Vec2, geom::Vec2>> innerEdgesOpen, outerEdgesOpen;
-    if (closed_mode)
+    // (요청 2) 추출된 모든 엣지 저장
     {
-        innerEdgesClosed = clip::ringEdges(inner);
-        outerEdgesClosed = clip::ringEdges(outer);
-    }
-    else
-    {
-        innerEdgesOpen = clip::ringEdgesPolyline(inner);
-        outerEdgesOpen = clip::ringEdgesPolyline(outer);
+        std::unordered_map<delaunay::EdgeKey, std::vector<delaunay::EdgeRef>, delaunay::EdgeKeyHash> M;
+        delaunay::buildEdgeMap(faces_kept, M);
+        std::vector<std::pair<int,int>> edges_all;
+        edges_all.reserve(M.size());
+        for (const auto& kv : M)
+            edges_all.push_back({kv.first.u, kv.first.v});
+        io::saveCSV_edgesIdx(base + "_edges_all_idx.csv", edges_all);
+        if (C.verbose) cerr << "[edges] all unique edges = " << edges_all.size() << "\n";
     }
 
-    // [5] 경계 엣지 중점 추출 + 길이 필터
-    vector<geom::Vec2> mids;
+    // [3] 라벨 다른 경계엣지 추출 + 길이 필터
+    std::vector<geom::Vec2> mids;
+    std::vector<int> keep_edge_idx; // 길이필터 통과한 경계엣지의 binfo 인덱스
+    std::vector<centerline::BoundaryEdgeInfo> binfo; // 재사용/저장용
     {
-        timing::ScopedAcc _t("5) 경계엣지 중점+길이필터", &T_mids);
-        auto binfo = centerline::labelBoundaryEdges_with_len(cdt.all, faces_kept, cdt.label);
+        timing::ScopedAcc _t("3) 경계엣지 중점+길이필터", &T_mids);
+        binfo = centerline::labelBoundaryEdges_with_len(cdt.all, faces_kept, cdt.label);
         if (binfo.empty())
         {
             cerr << "[ERR] no label-different boundary edges\n";
             return 4;
         }
 
-        vector<double> edge_lengths;
-        edge_lengths.reserve(binfo.size());
-        for (auto &e : binfo)
-            edge_lengths.push_back(e.len);
-        std::sort(edge_lengths.begin(), edge_lengths.end());
-        auto q = [&](double p) -> double
-        {
-            if (edge_lengths.empty())
-                return 0.0;
-            double idx = p * (edge_lengths.size() - 1);
-            size_t i = (size_t)std::floor(idx);
-            size_t j = std::min(i + 1, edge_lengths.size() - 1);
-            double t = idx - i;
-            return (1.0 - t) * edge_lengths[i] + t * edge_lengths[j];
-        };
-        double Lmed = q(0.5);
+        // (요청 3) 라벨 다른 엣지 저장
+        std::vector<std::pair<int,int>> edges_mixed;
+        edges_mixed.reserve(binfo.size());
+        for (auto &e : binfo) edges_mixed.push_back({e.u, e.v});
+        io::saveCSV_edgesIdx(base + "_edges_labeldiff_idx.csv", edges_mixed);
+        if (C.verbose) cerr << "[edges] label-different edges = " << edges_mixed.size() << "\n";
 
-        bool apply_len_filter = cfg::get().enable_boundary_len_filter;
+        // 길이 중앙값 기반 컷오프
+        std::vector<double> lens; lens.reserve(binfo.size());
+        for (auto &e : binfo) lens.push_back(e.len);
+        std::sort(lens.begin(), lens.end());
+        auto quant = [&](double p)->double{
+            if (lens.empty()) return 0.0;
+            double idx = p * (lens.size()-1);
+            size_t i = (size_t)std::floor(idx);
+            size_t j = std::min(i+1, lens.size()-1);
+            double t = idx - i;
+            return (1.0-t)*lens[i] + t*lens[j];
+        };
+        double Lmed = quant(0.5);
+        bool apply = cfg::get().enable_boundary_len_filter;
         double cutoff = std::min(cfg::get().boundary_edge_abs_max,
                                  cfg::get().boundary_edge_len_scale * std::max(1e-12, Lmed));
-        mids.reserve(binfo.size());
-        for (auto &e : binfo)
-            if (!apply_len_filter || e.len <= cutoff)
-                mids.push_back(e.mid);
 
+        // 필터 통과 중점/인덱스
+        mids.reserve(binfo.size());
+        keep_edge_idx.reserve(binfo.size());
+        for (int i=0;i<(int)binfo.size();++i){
+            const auto &e = binfo[i];
+            if (!apply || e.len <= cutoff){
+                mids.push_back(e.mid);
+                keep_edge_idx.push_back(i);
+            }
+        }
         if (mids.size() < 2)
         {
             cerr << "[ERR] not enough midpoints after length filter (" << mids.size() << "), adjust thresholds.\n";
             io::saveCSV_pointsXY(base + "_mids_raw.csv", mids);
             return 4;
         }
+
+        // (요청 4) 길이 필터 통과한 엣지 저장
+        std::vector<std::pair<int,int>> edges_kept;
+        edges_kept.reserve(keep_edge_idx.size());
+        for (int idx : keep_edge_idx){
+            const auto &e = binfo[idx];
+            edges_kept.push_back({e.u, e.v});
+        }
+        io::saveCSV_edgesIdx(base + "_edges_labeldiff_kept_idx.csv", edges_kept);
+        if (C.verbose) cerr << "[edges] kept (len-filtered label-diff) = " << edges_kept.size()
+                            << " / " << binfo.size() << "\n";
     }
 
     // 샘플 수 동적 조정
@@ -2787,52 +2793,170 @@ int main(int argc, char **argv)
         int total_mids = (int)mids.size();
         int dyn = (int)std::llround(C.sample_factor_n * std::max(0, total_mids));
         dyn = std::max(dyn, C.samples_min);
-        if (C.samples_max > 0)
-            dyn = std::min(dyn, C.samples_max);
+        if (C.samples_max > 0) dyn = std::min(dyn, C.samples_max);
         dyn = std::max(dyn, 4);
         if (C.verbose)
             cerr << "[samples] dynamic=" << dyn << "  (n=" << C.sample_factor_n << ", mids_raw=" << total_mids << ")\n";
         C.samples = dyn;
     }
 
-    // [6] 중점 순서화(MST 지름경로) + 방향/회전 정합
-    vector<geom::Vec2> ordered;
+    // [4] 중점 순서화(MST) + 방향/시작점 정합 (교체)
+    std::vector<geom::Vec2> ordered;
+    std::vector<int> mids_order_idx;
     {
-        timing::ScopedAcc _t("6) 중점 순서화(MST)+방향정합", &T_orderMST);
-        ordered = centerline::orderByMST(mids);
+        timing::ScopedAcc _t("4) 중점 순서화(MST)+방향/시작점 정합", &T_orderMST);
 
-        if (closed_mode)
-        {
-            if (ordered.size() >= 3 && orient::signedArea(ordered) < 0.0)
-                std::reverse(ordered.begin(), ordered.end());
-            geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
-            rotate_closed_chain_to_anchor(ordered, start_anchor);
-        }
-        else
-        {
+        ordered = centerline::orderByMST(mids);
+        mids_order_idx = centerline::orderIndicesByMST(mids);
+
+        // ---- 유틸 ----
+        auto reverse_both = [&](std::vector<geom::Vec2>& A, std::vector<int>& B){
+            std::reverse(A.begin(), A.end());
+            std::reverse(B.begin(), B.end());
+        };
+        auto dist2 = [](const geom::Vec2& p, const geom::Vec2& q){
+            double dx=p.x-q.x, dy=p.y-q.y; return dx*dx+dy*dy;
+        };
+        auto nearest_idx = [&](const std::vector<geom::Vec2>& S, const geom::Vec2& target)->size_t{
+            size_t k=0; double best=1e300;
+            for(size_t i=0;i<S.size();++i){ double d=dist2(S[i], target); if(d<best){best=d; k=i;} }
+            return k;
+        };
+        auto vnorm = [](const geom::Vec2& v)->geom::Vec2{
+            return geom::normalize(v, 1e-12);
+        };
+        // OPEN: 단순 끝점 처리 (wrap 없음)
+        auto local_dir_open = [&](const std::vector<geom::Vec2>& S, size_t i)->geom::Vec2{
+            if (S.size()<2) return {1,0};
+            if (i+1 < S.size()) return vnorm(geom::Vec2{S[i+1].x - S[i].x, S[i+1].y - S[i].y});
+            // i == 마지막 → 직전에서 현재로
+            return vnorm(geom::Vec2{S[i].x - S[i-1].x, S[i].y - S[i-1].y});
+        };
+        // CLOSED: 다음 점은 wrap
+        auto local_dir_closed = [&](const std::vector<geom::Vec2>& S, size_t i)->geom::Vec2{
+            if (S.size()<2) return {1,0};
+            size_t j = (i+1) % S.size();
+            return vnorm(geom::Vec2{S[j].x - S[i].x, S[j].y - S[i].y});
+        };
+
+        if (!closed_mode) {
+            // ===== OPEN =====
+            // 1) 방향: "현재 차량 위치"에 가장 가까운 중점 i*와 그 다음점 방향벡터 vs "현재 차량 헤딩"
             geom::Vec2 curr_pos{C.current_pos_x, C.current_pos_y};
-            geom::Vec2 curr_dir = geom::normalize(dir_from_heading_rad(C.current_heading_rad), 1e-12);
-            enforce_open_orientation_precise(ordered, curr_pos, curr_dir);
+            geom::Vec2 curr_dir = vnorm(dir_from_heading_rad(C.current_heading_rad));
+
+            size_t i_near_cur = nearest_idx(ordered, curr_pos);
+            geom::Vec2 vloc = local_dir_open(ordered, i_near_cur);
+            double dotv = vloc.x*curr_dir.x + vloc.y*curr_dir.y;
+            if (dotv < 0.0)
+                reverse_both(ordered, mids_order_idx);
+
+            // 2) 시작점: "차량 초기 위치(start_anchor)"에 가장 가까운 중점이 index 0이 되도록 회전
+            geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
+            size_t k = nearest_idx(ordered, start_anchor);
+            std::rotate(ordered.begin(), ordered.begin()+k, ordered.end());
+            std::rotate(mids_order_idx.begin(), mids_order_idx.begin()+k, mids_order_idx.end());
+        } else {
+            // ===== CLOSED =====
+            // 1) 방향: "초기 위치(start_anchor)에 가장 가까운 중점 i*의 국소 진행방향" vs "초기 차량 헤딩"
+            geom::Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
+            geom::Vec2 init_dir = vnorm(dir_from_heading_rad(C.start_heading_rad));
+
+            size_t i_near_anchor = nearest_idx(ordered, start_anchor);
+            geom::Vec2 vloc = local_dir_closed(ordered, i_near_anchor);
+            double dotv = vloc.x*init_dir.x + vloc.y*init_dir.y;
+            if (dotv < 0.0)
+                reverse_both(ordered, mids_order_idx);
+
+            // (옵션) 무조건 CCW를 원하면 아래 한 줄을 켜면 됨:
+            // if (ordered.size() >= 3 && orient::signedArea(ordered) < 0.0) reverse_both(ordered, mids_order_idx);
+
+            // 2) 시작점: start_anchor에 가장 가까운 중점이 index 0이 되도록 회전
+            i_near_anchor = nearest_idx(ordered, start_anchor); // 뒤집혔을 수 있으니 재계산
+            std::rotate(ordered.begin(), ordered.begin()+i_near_anchor, ordered.end());
+            std::rotate(mids_order_idx.begin(), mids_order_idx.begin()+i_near_anchor, mids_order_idx.end());
         }
+
         io::saveCSV_pointsXY(base + "_mids_raw.csv", mids);
         io::saveCSV_pointsXY(base + "_mids_ordered.csv", ordered);
     }
 
-    // [7] 자연 3차 스플라인 + 균일 재샘플
+    // [5] 중점 순서를 이용해 링(콘) 재정렬
+    std::vector<geom::Vec2> inner_from_mids, outer_from_mids;
+    {
+        std::vector<char> seen_inner(cdt.all.size(), 0);
+        std::vector<char> seen_outer(cdt.all.size(), 0);
+
+        auto get_inner_outer = [&](int u, int v, int &iv, int &ov){
+            // label: 0=inner, 1=outer
+            if (cdt.label[u] == 0 && cdt.label[v] == 1){ iv = u; ov = v; }
+            else if (cdt.label[u] == 1 && cdt.label[v] == 0){ iv = v; ov = u; }
+            else { iv = ov = -1; } // 방어
+        };
+
+        for (int k=0; k<(int)mids_order_idx.size(); ++k){
+            int mid_local_idx = mids_order_idx[k];    // mids[] 기준 인덱스
+            int eidx = keep_edge_idx[mid_local_idx];  // binfo 인덱스
+            int u = binfo[eidx].u, v = binfo[eidx].v;
+
+            int iv=-1, ov=-1;
+            get_inner_outer(u, v, iv, ov);
+            if (iv>=0 && !seen_inner[iv]){ inner_from_mids.push_back(cdt.all[iv]); seen_inner[iv]=1; }
+            if (ov>=0 && !seen_outer[ov]){ outer_from_mids.push_back(cdt.all[ov]); seen_outer[ov]=1; }
+        }
+
+        // ====== 방향 정리 (중점 방향에 맞춤) ======
+        auto vnorm = [&](const geom::Vec2& a)->geom::Vec2{
+            return geom::normalize(a, 1e-12);
+        };
+        auto first_dir = [&](const std::vector<geom::Vec2>& S)->geom::Vec2{
+            if (S.size()<2) return geom::Vec2{1,0};
+            return vnorm(geom::Vec2{S[1].x - S[0].x, S[1].y - S[0].y});
+        };
+        // 중점 진행 방향(기준)
+        geom::Vec2 v_ref = first_dir(ordered);
+
+        auto align_to_mids_dir = [&](std::vector<geom::Vec2>& seq){
+            if (seq.size()<2) return;
+            geom::Vec2 v_seq = first_dir(seq);
+            double d = v_ref.x * v_seq.x + v_ref.y * v_seq.y;
+            if (d < 0.0) std::reverse(seq.begin(), seq.end());
+        };
+
+        // ★ inner/outer 모두 중점 방향에 정렬
+        align_to_mids_dir(inner_from_mids);
+        align_to_mids_dir(outer_from_mids);
+
+        // 저장(디버깅/재사용)
+        io::saveCSV_pointsXY(base + "_inner_from_mids.csv", inner_from_mids);
+        io::saveCSV_pointsXY(base + "_outer_from_mids.csv", outer_from_mids);
+
+        if (C.verbose){
+            int want_in=0, want_out=0;
+            for(int i=0;i<(int)cdt.label.size();++i){
+                want_in  += (cdt.label[i]==0);
+                want_out += (cdt.label[i]==1);
+            }
+            std::cerr << "[cones-from-mids] inner used " << inner_from_mids.size() << "/" << want_in
+                    << ", outer used " << outer_from_mids.size() << "/" << want_out << "\n";
+        }
+    }
+
+    // [6] 스플라인 + 균일 재샘플 (센터라인)
     centerline::Spline1D spx, spy;
     double s0 = 0.0, L = 0.0;
-    vector<geom::Vec2> center;
+    std::vector<geom::Vec2> center;
     {
-        timing::ScopedAcc _t("7) 스플라인+균일 재샘플", &T_spline);
+        timing::ScopedAcc _t("5) 스플라인+균일 재샘플", &T_spline);
         int paddingK = closed_mode ? 3 : 0;
         center = centerline::splineUniformClosed_EXPORT_CONTEXT(
             ordered, C.samples, paddingK, /*close_loop=*/C.emit_closed_duplicate,
             spx, spy, s0, L);
     }
 
-    // [8] 센터라인 CSV 저장
+    // [7] 센터라인 CSV 저장
     {
-        timing::ScopedAcc _t("8) centerline 저장", &T_saveCenter);
+        timing::ScopedAcc _t("6) centerline 저장", &T_saveCenter);
         std::ofstream fo(outPath);
         if (!fo)
         {
@@ -2845,21 +2969,28 @@ int main(int argc, char **argv)
             fo << p.x << "," << p.y << "\n";
     }
 
-    // [9] 기하량 + 폭(width) 계산 및 저장
+    // [8] 기하량 + 폭(width) 계산 및 저장  (★ 재구성 링의 엣지를 사용 ★)
     {
-        timing::ScopedAcc _t("9) geom+width 계산/저장", &T_geom);
-        const auto &innerE = closed_mode ? innerEdgesClosed : innerEdgesOpen;
-        const auto &outerE = closed_mode ? outerEdgesClosed : outerEdgesOpen;
+        timing::ScopedAcc _t("7) geom+width 계산/저장", &T_geom);
+
+        // 재구성 링에서 엣지 구성
+        std::vector<std::pair<geom::Vec2, geom::Vec2>> innerE, outerE;
+        if (closed_mode){
+            innerE = clip::ringEdges(inner_from_mids);
+            outerE = clip::ringEdges(outer_from_mids);
+        } else {
+            innerE = clip::ringEdgesPolyline(inner_from_mids);
+            outerE = clip::ringEdgesPolyline(outer_from_mids);
+        }
 
         std::ofstream fo2(base + "_with_geom.csv");
         if (!fo2) { cerr << "[ERR] save centerline_with_geom\n"; return 6; }
         fo2.setf(std::ios::fixed);
         fo2.precision(9);
 
-        // ▼▼▼ 헤더에 v_kappa_mps 추가 ▼▼▼
         fo2 << "s,x,y,heading_rad,curvature,dist_to_inner,dist_to_outer,width,v_kappa_mps\n";
 
-        double x0=0, y0=0, hd0=0, k0=0, din0=0, dout0=0, w0=0, v0=0;  // v0 추가
+        double x0=0, y0=0, hd0=0, k0=0, din0=0, dout0=0, w0=0, v0=0;
         const int Ncenter = (int)center.size();
         const int Kmax = closed_mode ? C.samples : Ncenter;
         const int denomN = closed_mode ? C.samples : std::max(1, C.samples);
@@ -2888,47 +3019,52 @@ int main(int argc, char **argv)
             double width = d_in + d_out;
             double si_rel = si - s0;
 
-            // ▼▼▼ v_kappa 계산 및 캡 ▼▼▼
             double denom_k = std::max(std::fabs(curvature), C.kappa_eps);
             double v_kappa = std::sqrt(C.a_lat_max / denom_k);
             if (v_kappa > C.v_cap_mps) v_kappa = C.v_cap_mps;
 
             if (k == 0) {
-                x0=x; y0=y; hd0=heading; k0=curvature; din0=d_in; dout0=d_out; w0=width; v0=v_kappa; // v0 저장
+                x0=x; y0=y; hd0=heading; k0=curvature; din0=d_in; dout0=d_out; w0=width; v0=v_kappa;
             }
 
-            // ▼▼▼ CSV에 v_kappa_mps 추가 ▼▼▼
             fo2 << si_rel << "," << x << "," << y << "," << heading << "," << curvature
                 << "," << d_in << "," << d_out << "," << width << "," << v_kappa << "\n";
         }
 
         if (C.emit_closed_duplicate) {
             fo2 << L << "," << x0 << "," << y0 << "," << hd0 << "," << k0
-                << "," << din0 << "," << dout0 << "," << w0 << "," << v0 << "\n"; // v0도 복제
+                << "," << din0 << "," << dout0 << "," << w0 << "," << v0 << "\n";
         }
     }
 
-
-    // [10] 최소 곡률 raceline (최적화)
+    // [9] 최소 곡률 raceline (최적화) — 재구성 링 사용
     std::vector<geom::Vec2> center_for_opt = center;
     if (closed_mode &&
         center_for_opt.size() >= 2 &&
         geom::almostEq(center_for_opt.front(), center_for_opt.back(), 1e-12))
     {
-        center_for_opt.pop_back(); // N = samples
+        center_for_opt.pop_back();
     }
     raceline_min_curv::Result res;
     {
-        timing::ScopedAcc _t("10) 최소곡률 레이싱라인 최적화", &T_race);
-        const auto &innerE = closed_mode ? innerEdgesClosed : innerEdgesOpen;
-        const auto &outerE = closed_mode ? outerEdgesClosed : outerEdgesOpen;
+        timing::ScopedAcc _t("8) 최소곡률 레이싱라인 최적화", &T_race);
+
+        std::vector<std::pair<geom::Vec2, geom::Vec2>> innerE, outerE;
+        if (closed_mode){
+            innerE = clip::ringEdges(inner_from_mids);
+            outerE = clip::ringEdges(outer_from_mids);
+        } else {
+            innerE = clip::ringEdgesPolyline(inner_from_mids);
+            outerE = clip::ringEdgesPolyline(outer_from_mids);
+        }
+
         res = raceline_min_curv::compute_min_curvature_raceline(
             center_for_opt, innerE, outerE, C.veh_width_m, /*L=*/L, /*closed=*/closed_mode);
     }
 
-    // [11] raceline 저장(좌표/geom)
+    // [10] raceline 저장(좌표/geom)
     {
-        timing::ScopedAcc _t("11) raceline 저장(좌표/geom)", &T_saveRace);
+        timing::ScopedAcc _t("9) raceline 저장(좌표/geom)", &T_saveRace);
         // 좌표
         {
             std::ofstream fo(base + "_raceline.csv");
@@ -2951,8 +3087,6 @@ int main(int argc, char **argv)
             if (!fo) { cerr << "[ERR] save raceline_with_geom\n"; return 8; }
             fo.setf(std::ios::fixed);
             fo.precision(9);
-
-            // ▼▼▼ 헤더에 v_kappa_mps 추가 ▼▼▼
             fo << "s,x,y,heading_rad,curvature,alpha_last,v_kappa_mps\n";
 
             const int Nrl = (int)res.raceline.size();
@@ -2960,24 +3094,22 @@ int main(int argc, char **argv)
                 double si = s0 + L * (double(k) / double(Nrl));
                 double si_rel = si - s0;
 
-                // ▼▼▼ v_kappa 계산 및 캡 (raceline 곡률 사용) ▼▼▼
                 double denom_k = std::max(std::fabs(res.curvature[k]), C.kappa_eps);
                 double v_kappa = std::sqrt(C.a_lat_max / denom_k);
                 if (v_kappa > C.v_cap_mps) v_kappa = C.v_cap_mps;
 
                 fo << si_rel << "," << res.raceline[k].x << "," << res.raceline[k].y << ","
-                << res.heading[k] << "," << res.curvature[k] << "," << res.alpha_last[k] << ","
-                << v_kappa << "\n";
+                   << res.heading[k] << "," << res.curvature[k] << "," << res.alpha_last[k] << ","
+                   << v_kappa << "\n";
             }
             if (C.emit_closed_duplicate && !res.raceline.empty()) {
-                // 첫 샘플의 v_kappa 재계산
                 double denom_k0 = std::max(std::fabs(res.curvature[0]), C.kappa_eps);
                 double v0 = std::sqrt(C.a_lat_max / denom_k0);
                 if (v0 > C.v_cap_mps) v0 = C.v_cap_mps;
 
                 fo << L << "," << res.raceline[0].x << "," << res.raceline[0].y << ","
-                << res.heading[0] << "," << res.curvature[0] << "," << res.alpha_last[0] << ","
-                << v0 << "\n";
+                   << res.heading[0] << "," << res.curvature[0] << "," << res.alpha_last[0] << ","
+                   << v0 << "\n";
             }
         }
     }
@@ -2987,8 +3119,8 @@ int main(int argc, char **argv)
         auto total_ms = std::chrono::duration_cast<timing::Ms>(timing::Clock::now() - _t_all).count();
         std::cerr.setf(std::ios::fixed);
         std::cerr << "[TIME][SUMMARY] total=" << std::setprecision(3) << total_ms << " ms  |  "
-                  << "load=" << T_load << ", order=" << T_order
-                  << ", cdt=" << T_cdt << ", clip=" << T_clip
+                  << "load=" << T_load
+                  << ", dt=" << T_cdt
                   << ", mids=" << T_mids << ", mst=" << T_orderMST
                   << ", spline=" << T_spline << ", saveC=" << T_saveCenter
                   << ", geom=" << T_geom << ", race=" << T_race
