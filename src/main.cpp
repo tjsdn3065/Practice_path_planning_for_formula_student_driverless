@@ -1,11 +1,11 @@
 // main.cpp (refactored, DT-only, readable)
 // ============================================================================
-//  센터라인 & 폭 계산 (오픈/폐루프) + 최소 곡률 레이싱라인
+//  센터라인 & 폭 계산 (오픈/폐루프) + 최소 곡률/시간 레이싱라인
 //  - cfg::Config 로 동작 제어
 //  - DT(Bowyer–Watson)만 사용 (CDT/클리핑/품질필터 제거)
 //  - MST 기반 중점 순서화 + OPEN/폐곡 "방향 & 시작점 정합"
 //  - inner/outer를 중점 진행방향과 동일하게 정렬
-//  - 스플라인 균일 재샘플 → 폭/기하량 계산 → 최소곡률 레이싱라인 최적화
+//  - 스플라인 균일 재샘플 → 폭/기하량 계산 → 최소곡률/시간 레이싱라인 최적화
 //  - 각 단계 CSV 덤프(디버깅 친화)
 // ============================================================================
 
@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 #include <chrono>
+#include <tuple>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846264338327950288
@@ -52,44 +53,43 @@ struct Config {
 
     bool  is_closed_track = true;        // 폐/비폐 모드
     bool  emit_closed_duplicate = true;  // 폐루프 결과 마지막=첫점 복제
-    bool  verbose = true;                   // 로그 출력
 
-    // 선택: 폐루프를 무조건 CCW로 강제할지 (기본 false)
+    // 폐루프를 무조건 CCW로 강제할지 (기본 false)
     bool  force_closed_ccw = false;
 
-    // 샘플링
     bool   add_micro_jitter = true;
     double jitter_eps = 1e-9;
 
+    // 샘플링
     int    samples = 300;
     bool   use_dynamic_samples = true;
-    double sample_factor_n = 1.0;
+    double sample_factor_n = 1.1;
     int    samples_min = 10;
     int    samples_max = 1000;
-
-    int    knn_k = 4; // MST k-NN
+    int    knn_k = 6;     // MST k-NN
 
     // 경계 엣지 길이 필터
     bool   enable_boundary_len_filter = true;
-    double boundary_edge_len_scale = 2.0;
-    double boundary_edge_abs_max   = 6.0;
+    double boundary_edge_len_scale = 1.5;
+    double boundary_edge_abs_max   = 5.5;
 
     // 코리도/차량
     double veh_width_m = 1.0;
     double safety_margin_m = 0.05;
 
-    // 최소곡률 최적화
-    double lambda_smooth = 1e-3;
-    int    max_outer_iters = 16;
-    int    max_inner_iters = 150;
-    double step_init = 0.6;
+    // 최적화(공통)
+    double lambda_smooth = 1.6e-3;
+    int    max_outer_iters = 14;
+    int    max_inner_iters = 120;
+    double step_init = 0.65;
     double step_min  = 1e-6;
     double armijo_c  = 1e-5;
 
+    // 제한/동역학
     double kappa_eps = 1e-6;
-    double v_cap_mps = 20.0;
+    double v_cap_mps = 27.0;
 
-    // --- dynamics/aero ---
+    // FSDS 기본차량 스펙에 맞춘 대략값
     double mass_kg      = 255.0;
     double Cd           = 0.30;
     double A_front_m2   = 1.00;    // or set K_drag directly
@@ -97,24 +97,25 @@ struct Config {
     double c_rr         = 0.015;
     double P_max_W      = 80000.0; // 60kW~80kW 사이 조정 가능
 
-    // friction circle (lat/long tradeoff)
-    double mu           = 1.1;    // dry asphalt with slicks-ish
-    double a_total_max  = mu * 9.81;  // ≈ 11.5
-    double a_lat_max = a_total_max;
-    double a_long_acc_cap   = 5.0;
-    double a_long_brake_cap = 5.0;
+    // 마찰/가속 한계 (슬릭, 마른 노면 가정)
+    double mu           = 1.17;    // dry asphalt with slicks-ish
+    double a_total_max  = mu * 9.81;
+    double a_lat_max = 11.0;
+    double a_long_acc_cap   = 8.0;
+    double a_long_brake_cap = 11.0;
 
-    double w_time_gain = 8.0;      // [-] min-time 가중치 강도 (lat-리미트 구간에 가중)
-    int    max_vpass_iters = 6;    // [-] v(s) 전/후진 패스 반복 횟수
+    // 최소시간 가중(코너 비중 ↑, 저속 구간 약간 보정)
+    double w_time_gain = 1.0;      // min-time 가중치 강도
+    double time_gamma_power = 2.0;    // γ 가중 승수 지수
+    bool   time_weight_use_inv_v = false; // 원하면 1/v 가중 추가
+    double inv_v_gain = 0.1;
+    int    max_vpass_iters = 6;    // v(s) 전/후진 패스 반복 횟수
+    bool   use_total_ge_lat = true;   // 총가속 >= 횡가속 한계 보장
 
     // === DEBUG ===
+    bool verbose = true;
     bool   debug_dump = true;        // 디버그 덤프 활성화
-    double debug_offset_warn_m = 0.05; // 센터라인 대비 편차 경고 기준 (m)
-
-    double time_gamma_power = 2.0;    // γ 가중 승수 지수(2~6 추천)
-    bool   time_weight_use_inv_v = true; // 원하면 1/v 가중 추가
-    double inv_v_gain = 0.8;
-    bool   use_total_ge_lat = true;   // 총가속 >= 횡가속 한계 보장
+    double debug_offset_warn_m = 0.04; // 센터라인 대비 편차 경고 기준 (m)
 };
 inline Config& get(){ static Config C; return C; }
 } // namespace cfg
