@@ -50,9 +50,9 @@ struct Config {
     double start_anchor_x = 0.0, start_anchor_y = 0.0;   // (closed 시작점 회전)
     double start_heading_rad = 0.0;                      // (closed 방향 정합)
 
-    bool  is_closed_track = false;        // 폐/비폐 모드
-    bool  emit_closed_duplicate = false;  // 폐루프 결과 마지막=첫점 복제
-    bool  verbose = true;
+    bool  is_closed_track = true;        // 폐/비폐 모드
+    bool  emit_closed_duplicate = true;  // 폐루프 결과 마지막=첫점 복제
+    bool  verbose = true;                   // 로그 출력
 
     // 선택: 폐루프를 무조건 CCW로 강제할지 (기본 false)
     bool  force_closed_ccw = false;
@@ -63,11 +63,11 @@ struct Config {
 
     int    samples = 300;
     bool   use_dynamic_samples = true;
-    double sample_factor_n = 1.5;
+    double sample_factor_n = 1.0;
     int    samples_min = 10;
-    int    samples_max = 500;
+    int    samples_max = 1000;
 
-    int    knn_k = 8; // MST k-NN
+    int    knn_k = 4; // MST k-NN
 
     // 경계 엣지 길이 필터
     bool   enable_boundary_len_filter = true;
@@ -86,9 +86,35 @@ struct Config {
     double step_min  = 1e-6;
     double armijo_c  = 1e-5;
 
-    double a_lat_max = 10.0;
     double kappa_eps = 1e-6;
-    double v_cap_mps = 27.0;
+    double v_cap_mps = 20.0;
+
+    // --- dynamics/aero ---
+    double mass_kg      = 255.0;
+    double Cd           = 0.30;
+    double A_front_m2   = 1.00;    // or set K_drag directly
+    double rho_air      = 1.225;
+    double c_rr         = 0.015;
+    double P_max_W      = 80000.0; // 60kW~80kW 사이 조정 가능
+
+    // friction circle (lat/long tradeoff)
+    double mu           = 1.1;    // dry asphalt with slicks-ish
+    double a_total_max  = mu * 9.81;  // ≈ 11.5
+    double a_lat_max = a_total_max;
+    double a_long_acc_cap   = 5.0;
+    double a_long_brake_cap = 5.0;
+
+    double w_time_gain = 8.0;      // [-] min-time 가중치 강도 (lat-리미트 구간에 가중)
+    int    max_vpass_iters = 6;    // [-] v(s) 전/후진 패스 반복 횟수
+
+    // === DEBUG ===
+    bool   debug_dump = true;        // 디버그 덤프 활성화
+    double debug_offset_warn_m = 0.05; // 센터라인 대비 편차 경고 기준 (m)
+
+    double time_gamma_power = 2.0;    // γ 가중 승수 지수(2~6 추천)
+    bool   time_weight_use_inv_v = true; // 원하면 1/v 가중 추가
+    double inv_v_gain = 0.8;
+    bool   use_total_ge_lat = true;   // 총가속 >= 횡가속 한계 보장
 };
 inline Config& get(){ static Config C; return C; }
 } // namespace cfg
@@ -737,6 +763,295 @@ static Result compute_min_curvature_raceline(const vector<Vec2>&center,
 }
 } // namespace raceline_min_curv
 
+// ============================ Raceline (min-time) =========================
+namespace raceline_min_time {
+using geom::Vec2;
+using raceline_min_curv::DiffOps;
+using raceline_min_curv::DiffOpsOpen;
+using raceline_min_curv::precompute_lin_geom_generic;
+using timing::ScopedAcc;
+
+struct VelProfile {
+    vector<double> v, ax;
+    double lap_time = 0.0;
+};
+
+static inline double clamp01(double x){ return x<0?0:(x>1?1:x); }
+
+static VelProfile velocity_profile_forward_backward(
+    const vector<double>& kappa, double h, bool closed)
+{
+    auto &C = cfg::get();
+    int N=(int)kappa.size(); if(N==0) return {};
+    vector<double> v(N, C.v_cap_mps);
+
+    // 곡률 한계 속도
+    for(int i=0;i<N;++i){
+        double k = std::fabs(kappa[i]);
+        double v_kappa = std::sqrt(C.a_lat_max / std::max(k, C.kappa_eps));
+        v[i] = std::min(v[i], v_kappa);
+    }
+
+    // 반복: 전/후진 패스 (마찰원 기반 종/제동 한계)
+    auto ax_max_at = [&](double vi, double ki)->std::pair<double,double>{
+        // 사용 횡가속
+        double alat = vi*vi*std::fabs(ki);
+    
+        // 총가속 한계(일관성 보장)
+        double a_total = cfg::get().use_total_ge_lat
+                       ? std::max(cfg::get().a_total_max, cfg::get().a_lat_max)
+                       : cfg::get().a_total_max;
+    
+        // 남는 종가속 여유(마찰원)
+        double a_res = std::sqrt(std::max(0.0, a_total*a_total - alat*alat));
+    
+        // 항력 + 구름저항
+        double Fd = 0.5*cfg::get().rho_air*cfg::get().Cd*cfg::get().A_front_m2*vi*vi;
+        double Fr = cfg::get().mass_kg*9.81*cfg::get().c_rr;
+    
+        // 파워 리미트
+        double a_power = (cfg::get().P_max_W>0 && vi>1e-6)
+                       ? (cfg::get().P_max_W/(cfg::get().mass_kg*vi) - (Fd+Fr)/cfg::get().mass_kg)
+                       : 1e9;
+    
+        double a_acc = std::min({a_res, cfg::get().a_long_acc_cap, a_power});
+        a_acc = std::max(0.0, a_acc);
+    
+        double a_brk = std::min(a_res, cfg::get().a_long_brake_cap) + (Fd+Fr)/cfg::get().mass_kg;
+        a_brk = std::max(0.0, a_brk);
+        return {a_acc, a_brk};
+    };    
+
+    int iters=C.max_vpass_iters;
+    while(iters--){
+        // forward(가속)
+        for(int i=0;i+1<N;++i){
+            auto [a_acc, a_brk] = ax_max_at(v[i], kappa[i]);
+            double vf = std::sqrt(std::max(0.0, v[i]*v[i] + 2.0*a_acc*h));
+            v[i+1] = std::min(v[i+1], vf);
+        }
+        if (closed){
+            // 루프 연속성 보정 한 사이클
+            auto [a_acc, a_brk] = ax_max_at(v[N-1], kappa[N-1]);
+            double vf0 = std::sqrt(std::max(0.0, v[N-1]*v[N-1] + 2.0*a_acc*h));
+            v[0] = std::min(v[0], vf0);
+        }
+        // backward(제동)
+        for(int i=N-2;i>=0;--i){
+            auto [a_acc, a_brk] = ax_max_at(v[i+1], kappa[i+1]);
+            double vb = std::sqrt(std::max(0.0, v[i+1]*v[i+1] + 2.0*a_brk*h));
+            v[i] = std::min(v[i], vb);
+        }
+        if (closed){
+            auto [a_acc, a_brk] = ax_max_at(v[0], kappa[0]);
+            double vbN = std::sqrt(std::max(0.0, v[0]*v[0] + 2.0*a_brk*h));
+            v[N-1] = std::min(v[N-1], vbN);
+        }
+    }
+
+    // ax, lap time
+    vector<double> ax(N,0.0); double t=0.0;
+    for(int i=0;i<N;++i){
+        int j = (i+1<N)? i+1 : (closed?0:i);
+        double v0=v[i], v1=v[j];
+        ax[i] = (v1*v1 - v0*v0) / (2.0*h);
+        t += h / std::max(1e-6, v[i]);
+    }
+    return {std::move(v), std::move(ax), t};
+}
+
+// time-weighted 최소곡률 스텝의 코스트/그라디언트
+struct CostGrad{ double J; vector<double> grad; };
+static CostGrad eval_cost_grad_timeweighted(
+    const vector<double>&A1,const vector<double>&A2,
+    const vector<double>&N0,const vector<double>&W,
+    const vector<double>&gamma2, double h, double lambda_smooth,
+    const vector<double>&alpha, bool closed)
+{
+    int N=(int)alpha.size();
+    vector<double> a1,a2;
+    if(closed){ DiffOps D(N,h); D.D1(alpha,a1); D.D2(alpha,a2); }
+    else{ DiffOpsOpen D(N,h); D.D1(alpha,a1); D.D2(alpha,a2); }
+
+    // r = W * (N0 + A1 a1 + A2 a2)
+    vector<double> r(N), z(N);
+    for(int i=0;i<N;++i) r[i] = W[i]*(N0[i] + A1[i]*a1[i] + A2[i]*a2[i]);
+
+    // J = sum gamma^2 * r^2 + lambda * ||a1||^2
+    double J=0; for(int i=0;i<N;++i) J += gamma2[i]*r[i]*r[i];
+    double Jsm=0; for(double v: a1) Jsm += v*v; J += lambda_smooth * Jsm;
+
+    // grad = 2 * (D1^T (A1 .* (W .* (gamma^2 .* r))) + D2^T (A2 .* (W .* (gamma^2 .* r)))) + 2λ D1^T D1 α
+    vector<double> Wg_r(N), q1(N), q2(N), g1,g2, D1a, gsm;
+    for(int i=0;i<N;++i){ Wg_r[i] = W[i] * gamma2[i] * r[i]; q1[i]=A1[i]*Wg_r[i]; q2[i]=A2[i]*Wg_r[i]; }
+
+    if(closed){ DiffOps D(N,h); D.D1T(q1,g1); D.D2T(q2,g2); D.D1(alpha,D1a); D.D1T(D1a,gsm); }
+    else{ DiffOpsOpen D(N,h); D.D1T(q1,g1); D.D2T(q2,g2); D.D1(alpha,D1a); D.D1T(D1a,gsm); }
+
+    vector<double> grad(N);
+    for(int i=0;i<N;++i) grad[i] = 2.0*(g1[i]+g2[i]) + 2.0*lambda_smooth*gsm[i];
+    return {J, std::move(grad)};
+}
+
+struct Result{
+    vector<Vec2> raceline;
+    vector<double> heading, curvature;
+    vector<double> alpha_total, alpha_last;
+    vector<double> v, ax;
+    double lap_time = 0.0;
+};
+
+static Result compute_min_time_raceline(
+    const vector<Vec2>& center,
+    const vector<pair<Vec2,Vec2>>& innerE,
+    const vector<pair<Vec2,Vec2>>& outerE,
+    double veh_width, double L, bool closed)
+{
+    auto &C = cfg::get();
+    int N=(int)center.size(); if(N==0) return {};
+    double h = L / double(N);
+
+    vector<Vec2> P = center, n; raceline_min_curv::normals_from_points_generic(P, closed, n);
+
+    auto safe_ray = [&](const Vec2&P0, const Vec2&dir, const vector<pair<Vec2,Vec2>>&E){
+        double t = rayToRingDistance(P0,dir,E);
+        if(!std::isfinite(t)) t = minDistanceToSegments_global(P0,E);
+        if(!std::isfinite(t)) t = 0.0;
+        return std::max(0.0, t);
+    };
+
+    // 초기 코리도
+    vector<double> lo(N,0.0), hi(N,0.0);
+    for(int i=0;i<N;++i){
+        Vec2 nv=n[i], P0=P[i], nneg{-nv.x,-nv.y};
+        double dpos = std::min(safe_ray(P0,nv,innerE), safe_ray(P0,nv,outerE));
+        double dneg = std::min(safe_ray(P0,nneg,innerE), safe_ray(P0,nneg,outerE));
+        double guard = veh_width*0.5 + C.safety_margin_m;
+        hi[i]=std::max(0.0, dpos-guard);
+        lo[i]=-std::max(0.0, dneg-guard);
+        if(!std::isfinite(hi[i])) hi[i]=0.0;
+        if(!std::isfinite(lo[i])) lo[i]=0.0;
+    }
+
+    vector<double> alpha(N,0.0), alpha_accum(N,0.0), alpha_last(N,0.0);
+
+    for(int outer=0; outer<C.max_outer_iters; ++outer){
+        // 선형화(곡률) 준비
+        auto G = precompute_lin_geom_generic(P, n, h, closed);
+        // 현재 곡률(실좌표) 계산
+        vector<double> heading, kappa;
+        raceline_min_curv::heading_curv_from_points_generic(P, h, closed, heading, kappa);
+
+        // v(s) 프로파일 (전/후진 패스)
+        auto VP = velocity_profile_forward_backward(kappa, h, closed);
+
+        // time-weight 생성
+        vector<double> gamma2(N,1.0);
+        double v_avg = 0.0; for (double vi : VP.v) v_avg += vi; v_avg /= std::max(1, N);
+
+        double mean_r = 0.0, mean_gamma = 0.0; // 디버그용
+        for (int i = 0; i < N; ++i) {
+            double k = std::fabs(kappa[i]);
+            double vkappa = std::sqrt(C.a_lat_max / std::max(k, C.kappa_eps));
+            // 횡가속 사용률 r = a_lat/a_lat_max = (v^2 * |kappa|) / a_lat_max
+            double r = std::pow( std::min(1.0, VP.v[i] / std::max(1e-6, vkappa)), 2.0 );
+            r = std::min(1.0, std::max(0.0, r));  // clamp
+
+            // (1) corner weight: (1 + w * r^p)
+            double corner_w = 1.0 + C.w_time_gain * std::pow(r, C.time_gamma_power);
+
+            // (2) slow segment weight: 1 + inv_v_gain * (v_avg / v - 1)  (>= 1)
+            double invv_w = 1.0;
+            if (C.time_weight_use_inv_v) {
+                double ratio = v_avg / std::max(1e-6, VP.v[i]);
+                invv_w = 1.0 + C.inv_v_gain * (ratio - 1.0);
+                if (invv_w < 1.0) invv_w = 1.0;   // 안정화
+                if (invv_w > 3.0) invv_w = 3.0;   // 과도 방지
+            }
+
+            double gamma = corner_w * invv_w;
+            gamma2[i] = gamma * gamma;
+
+            mean_r += r; mean_gamma += gamma;
+        }
+        mean_r /= std::max(1, N);
+        mean_gamma /= std::max(1, N);
+        std::cerr << "[MT gamma] mean_r=" << std::fixed << std::setprecision(3) << mean_r
+                << " mean_gamma=" << mean_gamma << "\n";
+
+        // ===== ADD: 코너 포화율 디버그 =====
+        int sat_cnt = 0;
+        for (int i = 0; i < N; ++i) {
+            double vkappa = std::sqrt(C.a_lat_max / std::max(std::fabs(kappa[i]), C.kappa_eps));
+            if (VP.v[i] >= 0.99 * vkappa) ++sat_cnt;   // kappa 제한 속도에 99% 이상 근접
+        }
+        double sat_ratio = 100.0 * sat_cnt / std::max(1, N);
+        std::cerr << "[MT sat] kappa-limited " << std::fixed << std::setprecision(1)
+                << sat_ratio << "% of samples\n";
+        // ===================================
+
+
+        // 한 번의 time-weighted 최소곡률 스텝 (projected gradient + Armijo)
+        double step=C.step_init;
+        auto cg = eval_cost_grad_timeweighted(G.A1,G.A2,G.N0,G.W,gamma2,h,C.lambda_smooth,alpha,closed);
+        double J_prev=cg.J; if(C.verbose) cerr<<"[MT "<<outer<<"] J0="<<J_prev<<" step="<<step<<" t="<<VP.lap_time<<"\n";
+
+        for(int it=0; it<C.max_inner_iters; ++it){
+            bool accepted=false; int bt=0;
+            while(bt<20){
+                vector<double> a_new(N);
+                for(int i=0;i<N;++i){
+                    double ai = alpha[i] - step*cg.grad[i];
+                    a_new[i] = std::min(hi[i], std::max(lo[i], ai));
+                }
+                auto cg_new = eval_cost_grad_timeweighted(G.A1,G.A2,G.N0,G.W,gamma2,h,C.lambda_smooth,a_new,closed);
+                double dec=0.0; for(int i=0;i<N;++i) dec += cg.grad[i]*(a_new[i]-alpha[i]);
+                if (cg_new.J <= cg.J + C.armijo_c*dec){
+                    alpha.swap(a_new); cg=std::move(cg_new); accepted=true; break;
+                }
+                step*=0.5; bt++; if(step<C.step_min) break;
+            }
+            if(!accepted) break;
+             // ===== ADD: 수용된 스텝의 그라디언트 크기 디버그 =====
+            double g2 = std::inner_product(cg.grad.begin(), cg.grad.end(),
+                                           cg.grad.begin(), 0.0);
+            std::cerr << "    [PG] J=" << cg.J
+                        << "  step=" << step
+                        << "  ||grad||^2=" << g2
+                        << "  bt=" << bt << "\n";
+            // ================================================
+            if(std::fabs(J_prev - cg.J) < 1e-10) break;
+            J_prev=cg.J;
+        }
+        alpha_last=alpha;
+
+        // 경로 업데이트 + 코리도 업데이트
+        for(int i=0;i<N;++i){ P[i].x += n[i].x*alpha[i]; P[i].y += n[i].y*alpha[i]; alpha_accum[i]+=alpha[i]; }
+        raceline_min_curv::normals_from_points_generic(P, closed, n);
+
+        for(int i=0;i<N;++i){
+            Vec2 nv=n[i], P0=P[i], nneg{-nv.x,-nv.y};
+            double dpos = std::min(safe_ray(P0,nv,innerE), safe_ray(P0,nv,outerE));
+            double dneg = std::min(safe_ray(P0,nneg,innerE), safe_ray(P0,nneg,outerE));
+            double guard = cfg::get().veh_width_m*0.5 + cfg::get().safety_margin_m;
+            hi[i]=std::max(0.0, dpos-guard); lo[i]=-std::max(0.0, dneg-guard);
+            if(!std::isfinite(hi[i])) hi[i]=0.0; if(!std::isfinite(lo[i])) lo[i]=0.0;
+        }
+        std::fill(alpha.begin(), alpha.end(), 0.0);
+    }
+
+    // 최종 기하/속도
+    vector<double> heading, kappa;
+    raceline_min_curv::heading_curv_from_points_generic(P, h, closed, heading, kappa);
+    auto VP = velocity_profile_forward_backward(kappa, h, closed);
+
+    return {std::move(P), std::move(heading), std::move(kappa),
+            std::move(alpha_accum), std::move(alpha_last),
+            std::move(VP.v), std::move(VP.ax), VP.lap_time};
+}
+} // namespace raceline_min_time
+
+
 // =============================== Pipeline =================================
 namespace pipeline {
 using geom::Vec2;
@@ -866,11 +1181,7 @@ static OrderedMids order_and_align_mids_open_closed(const vector<Vec2>& mids, bo
         rotate_both(R.ordered, R.mids_order_idx, k);
     } else {
         // CLOSED:
-        // 옵션1) 강제 CCW
-        if (cfg::get().force_closed_ccw && R.ordered.size()>=3){
-            if (geom::polygonSignedArea(R.ordered) < 0.0) reverse_both(R.ordered, R.mids_order_idx);
-        }
-        // 옵션2) 초기 헤딩 기준 방향 정합 (기본)
+        // 초기 헤딩 기준 방향 정합 (기본)
         Vec2 start_anchor{C.start_anchor_x, C.start_anchor_y};
         Vec2 init_dir = vnorm(dir_from_heading_rad(C.start_heading_rad));
         size_t i_near_anchor = nearest_idx(R.ordered, start_anchor);
@@ -1070,7 +1381,217 @@ static void compute_raceline_and_save(const string& base,
     }
 }
 
-} // namespace pipeline
+static void compute_mintime_and_save(const string &base,
+                                     const vector<Vec2> &center_for_opt,
+                                     double s0, double L, bool closed_mode,
+                                     const vector<Vec2> &inner_from_mids,
+                                     const vector<Vec2> &outer_from_mids)
+{
+    auto &C = cfg::get();
+    vector<pair<Vec2, Vec2>> innerE = closed_mode ? edges::ringEdges(inner_from_mids)
+                                                  : edges::polylineEdges(inner_from_mids);
+    vector<pair<Vec2, Vec2>> outerE = closed_mode ? edges::ringEdges(outer_from_mids)
+                                                  : edges::polylineEdges(outer_from_mids);
+
+    auto res = raceline_min_time::compute_min_time_raceline(
+        center_for_opt, innerE, outerE, C.veh_width_m, L, closed_mode);
+
+    // 좌표
+    {
+        std::ofstream fo(base + "_mintime_raceline.csv");
+        if (!fo)
+            throw std::runtime_error("save mintime_raceline failed");
+        fo.setf(std::ios::fixed);
+        fo.precision(9);
+        for (auto &p : res.raceline)
+            fo << p.x << "," << p.y << "\n";
+        if (C.emit_closed_duplicate && !res.raceline.empty())
+            fo << res.raceline[0].x << "," << res.raceline[0].y << "\n";
+    }
+
+    // 기하+속도/가속 / 랩타임
+    {
+        std::ofstream fo(base + "_mintime_with_geom.csv");
+        if (!fo)
+            throw std::runtime_error("save mintime_with_geom failed");
+        fo.setf(std::ios::fixed);
+        fo.precision(9);
+        fo << "s,x,y,heading_rad,curvature,alpha_last,v_mps,ax_mps2\n";
+        int N = (int)res.raceline.size();
+        for (int k = 0; k < N; ++k)
+        {
+            double si = s0 + L * (double(k) / double(std::max(1, N)));
+            double si_rel = si - s0;
+            fo << si_rel << "," << res.raceline[k].x << "," << res.raceline[k].y << ","
+               << res.heading[k] << "," << res.curvature[k] << "," << res.alpha_last[k] << ","
+               << res.v[k] << "," << res.ax[k] << "\n";
+        }
+        if (C.emit_closed_duplicate && N > 0)
+        {
+            fo << L << "," << res.raceline[0].x << "," << res.raceline[0].y << ","
+               << res.heading[0] << "," << res.curvature[0] << "," << res.alpha_last[0] << ","
+               << res.v[0] << "," << res.ax[0] << "\n";
+        }
+    }
+    std::cerr << "[mintime] Estimated laptime: " << std::fixed << std::setprecision(3)
+              << res.lap_time << " s\n";
+
+    // ====================== DEBUG: center / min-curv / min-time 비교 ======================
+    if (cfg::get().debug_dump) {
+        auto &C = cfg::get();
+
+        // 1) 보조 유틸
+        auto path_length = [&](const vector<Vec2>& P, bool closed)->double{
+            double Ltot=0.0; int Np=(int)P.size(); if(Np<=1) return 0.0;
+            for(int i=0;i+1<Np;++i){ Ltot += std::hypot(P[i+1].x-P[i].x, P[i+1].y-P[i].y); }
+            if (closed && Np>=2) Ltot += std::hypot(P[0].x-P[Np-1].x, P[0].y-P[Np-1].y);
+            return Ltot;
+        };
+        auto clamp01 = [&](double x){ return x<0?0:(x>1?1:x); };
+
+        // 2) (선택) 최소곡률 경로 로드
+        vector<Vec2> raceline_mincurv = io::loadCSV_XY(base + "_raceline.csv");
+        if (!raceline_mincurv.empty() && closed_mode &&
+            raceline_mincurv.size()>=2 &&
+            geom::almostEq(raceline_mincurv.front(), raceline_mincurv.back(), 1e-12))
+        {
+            raceline_mincurv.pop_back();
+        }
+
+        // 3) 센터라인 법선(부호 있는 편차 산출용)
+        vector<Vec2> n_center;
+        raceline_min_curv::normals_from_points_generic(center_for_opt, closed_mode, n_center);
+
+        // 4) 센터라인/최소곡률의 랩타임(동일 동역학으로) 산출해서 참고치 출력
+        auto Hc = center_for_opt.size()>0 ? (L / std::max(1,(int)center_for_opt.size())) : 1.0;
+        vector<double> hd_c, kap_c;
+        raceline_min_curv::heading_curv_from_points_generic(center_for_opt, Hc, closed_mode, hd_c, kap_c);
+        auto VP_c = raceline_min_time::velocity_profile_forward_backward(kap_c, Hc, closed_mode);
+
+        double lap_mc = -1.0;
+        if (!raceline_mincurv.empty()){
+            double L_mc = path_length(raceline_mincurv, closed_mode);
+            double Hmc  = L_mc / std::max(1,(int)raceline_mincurv.size());
+            vector<double> hd_mc, kap_mc;
+            raceline_min_curv::heading_curv_from_points_generic(raceline_mincurv, Hmc, closed_mode, hd_mc, kap_mc);
+            auto VP_mc = raceline_min_time::velocity_profile_forward_backward(kap_mc, Hmc, closed_mode);
+            lap_mc = VP_mc.lap_time;
+            std::cerr << "[debug] centerline lap ≈ " << std::setprecision(3) << VP_c.lap_time
+                    << " s,  min-curv lap ≈ " << VP_mc.lap_time
+                    << " s,  min-time lap ≈ " << res.lap_time << " s\n";
+        } else {
+            std::cerr << "[debug] centerline lap ≈ " << std::setprecision(3) << VP_c.lap_time
+                    << " s,  (min-curv not found),  min-time lap ≈ " << res.lap_time << " s\n";
+        }
+
+        // 5) 비교 CSV 덤프
+        const int N = (int)std::min<size_t>(res.raceline.size(), center_for_opt.size());
+        std::ofstream fcmp(base + "_debug_compare_paths.csv");
+        if (fcmp){
+            fcmp.setf(std::ios::fixed); fcmp.precision(9);
+            fcmp << "s,cx,cy,mt_x,mt_y,mc_x,mc_y,d_mt_signed_m,d_mc_signed_m,"
+                    "d_mt_abs_m,d_mc_abs_m,kappa_mt,v_mt,ax_mt,alat_mt,alat_ratio,"
+                    "gamma,a_acc_cap,a_brk_cap,a_power_cap\n";
+
+            // 통계
+            double sum_abs_mt=0.0, sum2_abs_mt=0.0, max_abs_mt=0.0; int idx_max_mt=0;
+            double sum_abs_mc=0.0, sum2_abs_mc=0.0, max_abs_mc=0.0; int idx_max_mc=0;
+            int near_cnt = 0;
+
+            // 전 구간 루프
+            for(int k=0;k<N;++k){
+                double si = s0 + L * (double(k) / double(std::max(1,N)));
+                const Vec2& Cpt = center_for_opt[k];
+                const Vec2& Mt  = res.raceline[k];
+                Vec2 Mc {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()};
+                if ((int)raceline_mincurv.size()>k) Mc = raceline_mincurv[k];
+
+                // 부호 있는 편차 (센터라인 법선 기준)
+                auto dmt = (Mt.x - Cpt.x)*n_center[k].x + (Mt.y - Cpt.y)*n_center[k].y;
+                auto dmc = (std::isfinite(Mc.x) ? (Mc.x - Cpt.x)*n_center[k].x + (Mc.y - Cpt.y)*n_center[k].y
+                                                : std::numeric_limits<double>::quiet_NaN());
+                double admt = std::fabs(dmt);
+                double admc = std::isfinite(dmc)? std::fabs(dmc) : std::numeric_limits<double>::quiet_NaN();
+
+                // 사용된 횡가속/가중치
+                double kappa_mt = (k<(int)res.curvature.size()? res.curvature[k]:0.0);
+                double v_mt     = (k<(int)res.v.size()?         res.v[k]        :0.0);
+                double ax_mt    = (k<(int)res.ax.size()?        res.ax[k]       :0.0);
+                double alat     = v_mt*v_mt*std::fabs(kappa_mt);
+                double alat_ratio = (C.a_total_max>1e-9)? std::min(1.0, alat / C.a_total_max) : 0.0;
+
+                double vkappa = std::sqrt(C.a_lat_max / std::max(std::fabs(kappa_mt), C.kappa_eps));
+                double pen = clamp01( (vkappa - v_mt) / std::max(1e-6, vkappa) );
+                double gamma = 1.0 + C.w_time_gain * pen;
+
+                // 종가속 한계(설명용)
+                auto ax_caps = [&](double vi, double ki){
+                    double alatloc = vi*vi*std::fabs(ki);
+                    double a_res = std::sqrt(std::max(0.0, C.a_total_max*C.a_total_max - alatloc*alatloc));
+                    double Fd = 0.5*C.rho_air*C.Cd*C.A_front_m2*vi*vi;
+                    double Fr = C.mass_kg*9.81*C.c_rr;
+                    double a_power = (C.P_max_W>0 && vi>1e-6)? (C.P_max_W/(C.mass_kg*vi) - (Fd+Fr)/C.mass_kg) : 1e9;
+                    double a_acc_cap = std::max(0.0, std::min({a_res, C.a_long_acc_cap, a_power}));
+                    double a_brk_cap = std::max(0.0, std::min(a_res, C.a_long_brake_cap) + (Fd+Fr)/C.mass_kg);
+                    return std::tuple<double,double,double>(a_acc_cap, a_brk_cap, std::max(0.0, a_power));
+                };
+                double a_acc_cap, a_brk_cap, a_power_cap;
+                std::tie(a_acc_cap,a_brk_cap,a_power_cap) = ax_caps(v_mt, kappa_mt);
+
+                // CSV 기록
+                fcmp << (si - s0) << ","
+                    << Cpt.x << "," << Cpt.y << ","
+                    << Mt.x  << "," << Mt.y  << ","
+                    << Mc.x  << "," << Mc.y  << ","
+                    << dmt   << "," << dmc   << ","
+                    << admt  << "," << admc  << ","
+                    << kappa_mt << "," << v_mt << "," << ax_mt << ","
+                    << alat << "," << alat_ratio << ","
+                    << gamma << "," << a_acc_cap << "," << a_brk_cap << "," << a_power_cap << "\n";
+
+                // 통계 집계
+                sum_abs_mt   += admt; sum2_abs_mt += admt*admt;
+                if (admt > max_abs_mt){ max_abs_mt = admt; idx_max_mt = k; }
+                if (std::isfinite(admc)){
+                    sum_abs_mc   += admc; sum2_abs_mc += admc*admc;
+                    if (admc > max_abs_mc){ max_abs_mc = admc; idx_max_mc = k; }
+                }
+                if (admt < C.debug_offset_warn_m) near_cnt++;
+            }
+            fcmp.close();
+
+            // 6) 요약 로그
+            double mean_mt = sum_abs_mt / std::max(1,N);
+            double rms_mt  = std::sqrt(sum2_abs_mt / std::max(1,N));
+            std::cerr << std::setprecision(3)
+                    << "[debug] min-time vs center: mean|offset|=" << mean_mt
+                    << " m, rms=" << rms_mt
+                    << " m, max=" << max_abs_mt << " m @i=" << idx_max_mt
+                    << ", within " << C.debug_offset_warn_m << " m : "
+                    << near_cnt << "/" << N << "\n";
+            if (max_abs_mc>0.0 && std::isfinite(max_abs_mc)){
+                double mean_mc = sum_abs_mc / std::max(1,N);
+                double rms_mc  = std::sqrt(sum2_abs_mc / std::max(1,N));
+                std::cerr << "[debug] min-curv vs center: mean|offset|=" << mean_mc
+                        << " m, rms=" << rms_mc
+                        << " m, max=" << max_abs_mc << " m @i=" << idx_max_mc << "\n";
+            }
+
+            // 7) “센터라인과 너무 비슷한가?” 판단 힌트
+            if (mean_mt < 0.01 && max_abs_mt < 0.03){
+                std::cerr << "[hint] min-time 경로가 센터라인과 매우 유사합니다. "
+                            "폭이 좁거나 곡률/동역학 제약이 강해서 경로 이동 여지가 작을 수 있어요.\n";
+            }
+            if (lap_mc>0.0){
+                double gain_vs_mc = (lap_mc - res.lap_time) / lap_mc * 100.0;
+                std::cerr << "[debug] lap gain vs min-curv: " << gain_vs_mc << " %\n";
+            }
+        } else {
+            std::cerr << "[debug] cfg::debug_dump=false (비교 CSV 생략)\n";
+        }
+    }
+}
+}// namespace pipeline
 
 // ================================== MAIN ==================================
 int main(int argc, char** argv){
@@ -1086,7 +1607,7 @@ int main(int argc, char** argv){
 
     auto &C = cfg::get();
 
-    double T_load=0, T_dt=0, T_mids=0, T_orderMST=0, T_spline=0, T_saveC=0, T_geom=0, T_race=0, T_saveR=0;
+    double T_load=0, T_dt=0, T_mids=0, T_orderMST=0, T_spline=0, T_saveC=0, T_geom=0, T_mincurv_race=0, T_mintime_race=0, T_saveR=0;
 
     // 1) 입력
     vector<geom::Vec2> inner, outer;
@@ -1155,12 +1676,22 @@ int main(int argc, char** argv){
 
     // 9) 최소곡률 레이싱라인 최적화 & 저장
     {
-        timing::ScopedAcc _t("8) 최소곡률 레이싱라인 최적화+저장", &T_race);
+        timing::ScopedAcc _t("8) 최소곡률 레이싱라인 최적화+저장", &T_mincurv_race);
         vector<geom::Vec2> center_for_opt = CL.center;
         if (closed_mode && center_for_opt.size()>=2 && geom::almostEq(center_for_opt.front(), center_for_opt.back(), 1e-12))
             center_for_opt.pop_back();
         pipeline::compute_raceline_and_save(base, center_for_opt, CL.s0, CL.L, closed_mode,
                                             RR.inner_from_mids, RR.outer_from_mids);
+    }
+
+    // 10) 최소시간 레이싱라인 최적화 & 저장
+    {
+        timing::ScopedAcc _t("9) 최소시간 레이싱라인 최적화+저장", &T_mintime_race);
+        vector<geom::Vec2> center_for_opt = CL.center;
+        if (closed_mode && center_for_opt.size()>=2 && geom::almostEq(center_for_opt.front(), center_for_opt.back(), 1e-12))
+            center_for_opt.pop_back();
+        pipeline::compute_mintime_and_save(base, center_for_opt, CL.s0, CL.L, closed_mode,
+                                        RR.inner_from_mids, RR.outer_from_mids);
     }
 
     // 요약
@@ -1174,7 +1705,8 @@ int main(int argc, char** argv){
                   << ", spline="<<T_spline
                   << ", saveC="<<T_saveC
                   << ", geom="<<T_geom
-                  << ", race="<<T_race
+                  << ", mincurv_race="<<T_mincurv_race
+                  << ", mintime_race="<<T_mintime_race
                   << "\n";
     }
     return 0;
